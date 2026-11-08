@@ -1,0 +1,13 @@
+{
+  "product": "rea-pencil-for-blender",
+  "version": [
+    0,
+    28,
+    6
+  ],
+  "blender_min": [
+    4,
+    4,
+    0
+  ]
+}

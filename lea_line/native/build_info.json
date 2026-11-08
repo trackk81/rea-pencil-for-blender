@@ -1,0 +1,22 @@
+{
+  "abi_version": 1,
+  "target": "x86_64-pc-windows-msvc",
+  "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "crt_linkage": "static",
+  "dll_sha256": "38f93f9b5b612b0a61bebc1b5d3ec121a2df508ac5775e67375555b1c11645a4",
+  "rust_source_sha256": "4e857d55a2ddc22cb049114c796777b4cdfd4b8a2eb9d24097a905f82ae36768",
+  "rust_source_files_sha256": {
+    "src/lib.rs": "4e857d55a2ddc22cb049114c796777b4cdfd4b8a2eb9d24097a905f82ae36768",
+    "src/ownership.rs": "7b2592396efd152d53c35b7a7ee33bf9d2c0f679cd80c3d434a1c240e531112b",
+    "include/rea_pencil_core.h": "dda385641b859c779780aa21ba2ea0df52155337754257836675aa44a4b26ac6"
+  },
+  "optional_exports": [
+    "rea_edge_owners_abi_version",
+    "rea_edge_owners_v1"
+  ],
+  "algorithms": [
+    "collection scope AND explicit-object OR material-slot face mask",
+    "detached manifold edge ownership: material > marked > crease"
+  ]
+}
