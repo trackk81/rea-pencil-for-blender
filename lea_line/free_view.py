@@ -1,11 +1,47 @@
 """Single-viewport helper camera. The scene's render camera is never changed."""
 import functools
+import time
 import bpy
 from bpy.props import BoolProperty
 from bpy.app.handlers import persistent
 TAG='rea_free_view_camera'
 _entries={}
 _active=None
+SETTLE_SECONDS=.2
+
+
+def _view_signature(area,region):
+    view=area.spaces.active.region_3d
+    return (tuple(tuple(row) for row in view.view_matrix),
+            tuple(tuple(row) for row in view.window_matrix),region.width,region.height,
+            area.spaces.active.clip_start,area.spaces.active.clip_end)
+
+
+def _hide_during_navigation(scene,entry):
+    """Hide only owned generated strokes, preserving per-view-layer visibility."""
+    from . import viewport
+    hidden=entry.setdefault('navigation_hidden',[])
+    known=set();alive=[]
+    for obj,layer in hidden:
+        try:known.add((obj.as_pointer(),layer.as_pointer()))
+        except ReferenceError:continue
+        alive.append((obj,layer))
+    entry['navigation_hidden']=hidden=alive
+    owner=scene.get(viewport.OWNER_SCENE_KEY)
+    if not owner:return
+    for obj in scene.objects:
+        if not viewport._owned(obj,owner):continue
+        for layer in scene.view_layers:
+            if (obj.as_pointer(),layer.as_pointer()) not in known and not obj.hide_get(view_layer=layer):
+                obj.hide_set(True,view_layer=layer);hidden.append((obj,layer))
+
+
+def _restore_navigation(entry):
+    for obj,layer in entry.pop('navigation_hidden',[]):
+        try:obj.hide_set(False,view_layer=layer)
+        except (ReferenceError,RuntimeError):pass
+    entry.pop('pending_signature',None)
+    entry.pop('pending_since',None)
 
 def camera(scene):
     entry=_entries.get(scene.as_pointer())
@@ -29,6 +65,7 @@ def context(function):
 def stop(scene):
     entry=_entries.pop(scene.as_pointer(),None)
     if entry:
+        _restore_navigation(entry)
         cam=entry['camera'];data=cam.data
         if cam.get(TAG):bpy.data.objects.remove(cam,do_unlink=True)
         if data.users==0 and data.get(TAG):bpy.data.cameras.remove(data)
@@ -37,7 +74,7 @@ def update(scene,area,region):
     entry=_entries[scene.as_pointer()];space=area.spaces.active;view=space.region_3d
     if view.view_perspective=='CAMERA':stop(scene);return True
     matrix=view.view_matrix.inverted();projection=view.window_matrix
-    flat=tuple(tuple(row) for row in matrix)+tuple(tuple(row) for row in projection)+(region.width,region.height)
+    flat=_view_signature(area,region)
     if entry.get('signature')==flat:return False
     cam=entry['camera'];cam.matrix_world=matrix
     cam.data.type='ORTHO' if view.view_perspective=='ORTHO' else 'PERSP'
@@ -55,6 +92,7 @@ def tick():
         scene=existing.get(key)
         if scene is None:
             _entries.pop(key,None)
+            _restore_navigation(entry)
             try:
                 cam=entry['camera'];data=cam.data
                 if cam.get(TAG):bpy.data.objects.remove(cam,do_unlink=True)
@@ -66,10 +104,29 @@ def tick():
         if area is None or not scene.lea_line.preview_enabled:
             stop(scene);continue
         region=next((r for r in area.regions if r.type=='WINDOW'),None)
-        if region and update(scene,area,region):
+        if region and area.spaces.active.region_3d.view_perspective=='CAMERA':
+            stop(scene)
+            from . import viewport
+            viewport.sync_preview(scene)
+            continue
+        if not region:continue
+        signature=_view_signature(area,region)
+        if getattr(scene.lea_line,'follow_refresh_mode','SETTLED')=='SETTLED':
+            if signature!=entry.get('signature'):
+                now=time.monotonic()
+                if signature!=entry.get('pending_signature'):
+                    entry['pending_signature']=signature;entry['pending_since']=now
+                _hide_during_navigation(scene,entry)
+                if now-entry['pending_since']<SETTLE_SECONDS:continue
+            elif 'pending_signature' in entry:
+                _restore_navigation(entry)
+        if update(scene,area,region):
             from . import viewport
             try:viewport.sync_preview(scene)
             except Exception as exc:scene.lea_line.last_message='Free View: '+str(exc);stop(scene)
+            finally:_restore_navigation(entry)
+        elif 'pending_signature' in entry:
+            _restore_navigation(entry)
     return 1/30 if _entries else None
 
 class LEA_OT_follow_view(bpy.types.Operator):
@@ -110,6 +167,7 @@ class LEA_OT_follow_view(bpy.types.Operator):
 @persistent
 def reset(*_):
     global _active
+    for entry in list(_entries.values()):_restore_navigation(entry)
     _entries.clear();_active=None
     if not hasattr(bpy.data,'objects'):return
     for obj in list(bpy.data.objects):

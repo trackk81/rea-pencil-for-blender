@@ -220,7 +220,12 @@ def draw_actions(layout, context, tree=None):
     row.operator('lea_line.render', text='Render', icon='RENDER_STILL')
     if settings.preview_enabled:
         from . import free_view
-        layout.label(text='자유 시점 추적 중' if context.scene.as_pointer() in free_view._entries else '카메라 기준 미리보기 · Numpad 0', icon='CAMERA_DATA')
+        entry=free_view._entries.get(context.scene.as_pointer())
+        layout.label(text='자유 시점 추적 중' if entry else '카메라 기준 미리보기 · Numpad 0', icon='CAMERA_DATA')
+        if entry:
+            layout.prop(settings,'follow_refresh_mode',text='갱신 방식')
+            if settings.follow_refresh_mode=='SETTLED':
+                layout.label(text='이동 중 선 숨김 · 멈추면 자동 갱신',icon='INFO')
     if context.scene.camera is None:
         layout.operator('lea_line.create_camera', text='카메라 자동 생성', icon='OUTLINER_OB_CAMERA')
         layout.label(text='미리보기·렌더용 카메라를 만듭니다', icon='INFO')
