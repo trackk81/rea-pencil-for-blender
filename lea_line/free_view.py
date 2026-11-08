@@ -119,6 +119,8 @@ def tick():
         if gpu_preview.active(scene):
             # POST_VIEW reads this region's actual matrices. No helper-camera
             # writes, Line Art evaluation or topology uploads on navigation.
+            if 'pending_signature' in entry or entry.get('navigation_hidden'):
+                _restore_navigation(entry)
             if area.spaces.active.region_3d.view_perspective=='CAMERA':stop(scene)
             continue
         if region and area.spaces.active.region_3d.view_perspective=='CAMERA':

@@ -141,6 +141,9 @@ def sync(scene):
     if bpy.app.background:
         raise ValueError('GPU 미리보기는 Blender 창에서 사용하세요')
     from . import backend
+    from . import free_view
+    followed=free_view._entries.get(scene.as_pointer())
+    if followed:free_view._restore_navigation(followed)
     jobs = _jobs(scene)
     start = time.perf_counter(); _building = True
     try:
@@ -313,11 +316,9 @@ def _draw():
     entry = _states.get(scene.as_pointer())
     if not entry or entry['error'] or bpy.app.is_job_running('RENDER'):return
     if context.space_data.shading.type != 'SOLID' or context.space_data.shading.show_xray:return
-    from . import free_view
-    followed = free_view._entries.get(scene.as_pointer())
-    if followed:
-        if context.area.as_pointer() != followed['area']:return
-    elif context.region_data.view_perspective != 'CAMERA':return
+    # Always use the current region's matrices, including during navigation,
+    # after leaving camera view, and in additional View3D areas. No helper is
+    # needed: the scene camera remains solely a final-render setting.
     import gpu
     start=time.perf_counter()
     depth, mask, blend = gpu.state.depth_test_get(), gpu.state.depth_mask_get(), gpu.state.blend_get()

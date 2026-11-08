@@ -211,30 +211,38 @@ class LEA_OT_open_line_editor(bpy.types.Operator):
 
 def draw_actions(layout, context, tree=None):
     settings = context.scene.lea_line
+    from . import gpu_preview
+    gpu_live=gpu_preview.active(context.scene)
     row = layout.row(align=True)
-    row.enabled = bool(settings.tree and context.scene.camera)
-    row.prop(settings, 'preview_enabled', text='Viewport Preview', toggle=True, icon='HIDE_OFF')
+    preview=row.row(align=True)
+    preview.enabled=bool(settings.tree and (context.scene.camera or settings.preview_compute=='GPU'))
+    preview.prop(settings, 'preview_enabled', text='Viewport Preview', toggle=True, icon='HIDE_OFF')
+    render=row.row(align=True);render.enabled=bool(settings.tree and context.scene.camera)
+    render.operator('lea_line.render', text='Render', icon='RENDER_STILL')
     views=layout.row(align=True)
-    views.operator('lea_line.follow_view',text='Follow Viewport').enabled=True
-    views.operator('lea_line.follow_view',text='Scene Camera').enabled=False
-    row.operator('lea_line.render', text='Render', icon='RENDER_STILL')
+    if gpu_live or (settings.preview_compute=='GPU' and not settings.preview_enabled):
+        views.label(text='GPU · 현재 시점을 자동 추적',icon='VIEW3D')
+    else:
+        views.operator('lea_line.follow_view',text='Follow Viewport').enabled=True
+        views.operator('lea_line.follow_view',text='Scene Camera').enabled=False
     layout.prop(settings,'preview_compute',text='뷰포트 계산')
     if settings.preview_enabled:
         from . import free_view
         entry=free_view._entries.get(context.scene.as_pointer())
-        layout.label(text='자유 시점 추적 중' if entry else '카메라 기준 미리보기 · Numpad 0', icon='CAMERA_DATA')
-        from . import gpu_preview
-        if gpu_preview.active(context.scene):
-            layout.label(text='GPU · Solid 기본 실선 · AA 차이 있음',icon='INFO')
-        elif settings.preview_compute=='GPU':
+        if gpu_live:
+            layout.label(text='이동 중에도 선 유지 · Solid / X-Ray 끔',icon='INFO')
+            layout.label(text='기본 실선 · AA 차이 있음',icon='INFO')
+        else:
+            layout.label(text='자유 시점 추적 중' if entry else '카메라 기준 미리보기 · Numpad 0', icon='CAMERA_DATA')
+        if not gpu_live and settings.preview_compute=='GPU':
             layout.label(text='GPU 미지원 설정 · Native 경로 사용',icon='ERROR')
-        if entry and not gpu_preview.active(context.scene):
+        if entry and not gpu_live:
             layout.prop(settings,'follow_refresh_mode',text='갱신 방식')
             if settings.follow_refresh_mode=='SETTLED':
                 layout.label(text='이동 중 선 숨김 · 멈추면 자동 갱신',icon='INFO')
     if context.scene.camera is None:
         layout.operator('lea_line.create_camera', text='카메라 자동 생성', icon='OUTLINER_OB_CAMERA')
-        layout.label(text='미리보기·렌더용 카메라를 만듭니다', icon='INFO')
+        layout.label(text='렌더용 카메라를 만듭니다' if settings.preview_compute=='GPU' else '미리보기·렌더용 카메라를 만듭니다', icon='INFO')
 
 
 def draw_start(layout, context):
