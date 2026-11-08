@@ -1532,6 +1532,25 @@ class LEA_OT_render(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class LEA_OT_render_lines(bpy.types.Operator):
+    bl_idname = 'lea_line.render_lines'
+    bl_label = '라인만 렌더'
+    bl_description = '현재 뷰 레이어의 Freestyle 선만 투명 배경으로 출력합니다. 저장 시 PNG RGBA를 선택하세요'
+
+    def execute(self,context):
+        from . import line_output
+        try:
+            result=line_output.render(context.scene,context.view_layer)
+        except Exception as exc:
+            self.report({'ERROR'},str(exc));return {'CANCELLED'}
+        context.scene.lea_line.last_render_seconds=result['seconds']
+        context.scene.lea_line.last_message=f"라인만 렌더: {result['seconds']:.3f}s · 투명 배경 · 저장 시 PNG RGBA"
+        if result['warnings']:self.report({'WARNING'},'; '.join(result['warnings']))
+        self.report({'INFO'},context.scene.lea_line.last_message)
+        if not bpy.app.background:bpy.ops.render.view_show('INVOKE_DEFAULT')
+        return {'FINISHED'}
+
+
 class LEA_OT_refresh_preview(bpy.types.Operator):
     bl_idname = "lea_line.refresh_preview"
     bl_label = "Refresh Live Preview"
@@ -1772,7 +1791,7 @@ CLASSES = (
     LEA_OT_panel_section, LEA_OT_brush_connection, LEA_OT_detail_connection, LEA_OT_reduction_connection,
     independent_reduction.LEA_OT_channel_reduction,
     LEA_OT_disconnect_line_set, LEA_OT_move_line_set,
-    LEA_OT_new_graph, LEA_OT_apply, LEA_OT_add_line_set, LEA_OT_render,
+    LEA_OT_new_graph, LEA_OT_apply, LEA_OT_add_line_set, LEA_OT_render, LEA_OT_render_lines,
     LEA_OT_refresh_preview,
     LEA_PT_scene, LEA_MT_nodes, LEA_PT_node_settings, LEA_PT_feature_coverage,
 )

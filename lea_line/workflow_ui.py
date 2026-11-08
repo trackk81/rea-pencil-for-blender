@@ -219,6 +219,8 @@ def draw_actions(layout, context, tree=None):
     preview.prop(settings, 'preview_enabled', text='Viewport Preview', toggle=True, icon='HIDE_OFF')
     render=row.row(align=True);render.enabled=bool(settings.tree and context.scene.camera)
     render.operator('lea_line.render', text='Render', icon='RENDER_STILL')
+    lines=layout.row();lines.enabled=bool(settings.tree and context.scene.camera)
+    lines.operator('lea_line.render_lines',text='라인만 렌더 · 투명 배경',icon='RENDERLAYERS')
     views=layout.row(align=True)
     if gpu_live or (settings.preview_compute=='GPU' and not settings.preview_enabled):
         views.label(text='GPU · 현재 시점을 자동 추적',icon='VIEW3D')
