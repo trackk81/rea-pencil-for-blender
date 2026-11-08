@@ -21,6 +21,14 @@ def active(scene):
     return scene.as_pointer() in _states
 
 
+def _tag_redraw(scene):
+    # A node-editor toggle need not invalidate the separate View3D region.
+    for window in bpy.context.window_manager.windows:
+        if window.scene==scene:
+            for area in window.screen.areas:
+                if area.type=='VIEW_3D':area.tag_redraw()
+
+
 def stats(scene):
     entry = _states.get(scene.as_pointer(), {})
     return {key: entry.get(key) for key in ('edges', 'build_ms', 'draw_ms', 'draws', 'uploads', 'dirty', 'error')}
@@ -200,7 +208,8 @@ def sync(scene):
         from . import curves,preview_runtime
         curves.mark_synced(scene);preview_runtime.mark_synced(scene)
     finally:_building = False
-    return ['GPU 시험 미리보기: Solid/재질 미리보기 · 곡선/점선/맵/숨은 선. 분기점은 선을 나누며 루프 시작·위상·연결부·AA는 Native와 다릅니다']
+    _tag_redraw(scene)
+    return ['GPU 시험 미리보기: Solid/재질/Rendered · 곡선/점선/맵/숨은 선. 분기점은 선을 나누며 루프 시작·위상·연결부·AA는 Native와 다릅니다']
 
 
 VERTEX = r'''
@@ -378,7 +387,8 @@ def _draw():
     entry = _states.get(scene.as_pointer())
     if not entry or entry['error'] or bpy.app.is_job_running('RENDER'):return
     shading=context.space_data.shading
-    if shading.type not in {'SOLID','MATERIAL'}:return
+    if shading.type not in {'SOLID','MATERIAL','RENDERED'}:return
+    if shading.type=='RENDERED' and scene.render.engine not in {'BLENDER_EEVEE_NEXT','CYCLES'}:return
     if shading.type=='SOLID' and shading.show_xray:return
     # Always use the current region's matrices, including during navigation,
     # after leaving camera view, and in additional View3D areas. No helper is
@@ -431,6 +441,7 @@ def stop(scene):
         _shader=None;_batch=None
         from . import gpu_chain
         gpu_chain.reset()
+    _tag_redraw(scene)
 
 
 @persistent
