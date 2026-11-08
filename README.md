@@ -24,7 +24,7 @@ REA Pencil Line 패널 또는 애드온 환경설정에서 **업데이트 확인
 
 현재는 단일 뷰 레이어의 메시 선, 원형 캡 및 GPU 미리보기에서 지원하는 브러시 범위를 사용합니다. 재질의 투명도는 가림 판정에 반영하지 않습니다. 미지원 기능은 오류로 알리며 Freestyle로 자동 전환하지 않습니다. 원본 Pencil+와 선 연결부·AA·굵기가 같다는 의미는 아닙니다.
 
-회귀 검사는 Blender에서 `--background --factory-startup --python tools/validate_independent_gpu.py`로 실행합니다. 실행 후 원래 렌더 엔진·합성·시퀀서·자동 갱신 설정을 복구합니다.
+회귀 검사는 Blender에서 `--background --factory-startup --python tools/validate_independent_gpu.py`로 실행합니다. 실행 후 원래 렌더 엔진·합성·시퀀서·자동 갱신 설정을 복구합니다. REA 선 전용 출력에 기존 Grease Pencil 선이 추가 합성되지 않도록 해당 렌더 동안만 제외하고, 완료·취소·실패 시 기존 표시 설정을 복구합니다.
 
 ## 0.28.12
 

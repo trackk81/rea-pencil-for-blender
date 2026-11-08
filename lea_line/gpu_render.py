@@ -13,6 +13,49 @@ import numpy as np
 from mathutils import Vector
 
 LAST_RESULT = {}
+_grease_pencil_scopes = {}
+
+
+def _exclude_grease_pencils(scene):
+    objects = [(obj, obj.hide_render) for obj in scene.objects
+               if obj.type == 'GREASEPENCIL' and not obj.hide_render]
+    try:
+        for obj, _ in objects:
+            obj.hide_render = True
+    except Exception:
+        _restore_grease_pencils(objects)
+        raise
+    return objects
+
+
+def _restore_grease_pencils(objects):
+    for obj, value in objects:
+        try:
+            if obj.hide_render != value:
+                obj.hide_render = value
+        except ReferenceError:
+            pass  # A deleted scene/object no longer has a setting to restore.
+
+
+@bpy.app.handlers.persistent
+def _render_init(scene, *args):
+    # Cover direct engine/F12 invocation as well as the REA line-only button.
+    if scene.render.engine == 'REA_PENCIL_GPU':
+        key = scene.as_pointer()
+        if key not in _grease_pencil_scopes:
+            _grease_pencil_scopes[key] = _exclude_grease_pencils(scene)
+
+
+@bpy.app.handlers.persistent
+def _render_end(scene, *args):
+    _restore_grease_pencils(_grease_pencil_scopes.pop(scene.as_pointer(), ()))
+
+
+@bpy.app.handlers.persistent
+def _restore_all(*args):
+    for objects in _grease_pencil_scopes.values():
+        _restore_grease_pencils(objects)
+    _grease_pencil_scopes.clear()
 
 
 def render_lines(scene, *, write_still=False):
@@ -22,6 +65,10 @@ def render_lines(scene, *, write_still=False):
     flags = {name: getattr(scene.render, name) for name in
              ('engine', 'use_freestyle', 'use_compositing', 'use_sequencer')}
     auto_sync = scene.lea_line.auto_sync
+    # Blender 4.4 adds its native Grease Pencil pass after an external engine's
+    # Combined result, even with compositor/sequencer/Freestyle disabled. A
+    # REA-only output must exclude that extra pass for this invocation only.
+    grease_pencils = []
     started = time.perf_counter()
     LAST_RESULT = {}
     try:
@@ -31,6 +78,7 @@ def render_lines(scene, *, write_still=False):
         scene.render.use_freestyle = False
         scene.render.use_compositing = False
         scene.render.use_sequencer = False
+        grease_pencils = _exclude_grease_pencils(scene)
         operation = bpy.ops.render.render(write_still=write_still, scene=scene.name)
         if 'CANCELLED' in operation or LAST_RESULT.get('status') == 'cancelled':
             return {'status': 'cancelled', 'seconds': time.perf_counter()-started}
@@ -39,6 +87,7 @@ def render_lines(scene, *, write_still=False):
         return dict(LAST_RESULT, seconds=time.perf_counter()-started, warnings=[
             '독립 GPU 선 렌더 · 메시 불투명 가림 판정 · 원본과 선 연결부/AA가 다릅니다'])
     finally:
+        _restore_grease_pencils(grease_pencils)
         for name, value in flags.items():
             setattr(scene.render, name, value)
         with ui.suspend_sync():
@@ -174,7 +223,20 @@ class REA_GPU_LINE_ENGINE(bpy.types.RenderEngine):
 
 def register():
     bpy.utils.register_class(REA_GPU_LINE_ENGINE)
+    for handlers, callback in ((bpy.app.handlers.render_init, _render_init),
+                              (bpy.app.handlers.render_complete, _render_end),
+                              (bpy.app.handlers.render_cancel, _render_end),
+                              (bpy.app.handlers.load_pre, _restore_all)):
+        if callback not in handlers:
+            handlers.append(callback)
 
 
 def unregister():
+    _restore_all()
+    for handlers, callback in ((bpy.app.handlers.render_init, _render_init),
+                              (bpy.app.handlers.render_complete, _render_end),
+                              (bpy.app.handlers.render_cancel, _render_end),
+                              (bpy.app.handlers.load_pre, _restore_all)):
+        if callback in handlers:
+            handlers.remove(callback)
     bpy.utils.unregister_class(REA_GPU_LINE_ENGINE)

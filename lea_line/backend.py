@@ -451,6 +451,9 @@ def _sync_thickness_modifiers(style, brush):
 
 @persistent
 def _render_pre(scene, *args):
+    if scene.render.engine == 'REA_PENCIL_GPU':
+        _render_started[scene.as_pointer()] = time.perf_counter()
+        return
     if hasattr(scene, "lea_line") and scene.lea_line.tree:
         if scene.lea_line.auto_sync and not (threading.current_thread() is not threading.main_thread()
                 and object_uv.prepared(scene.name_full,scene.frame_current)):
