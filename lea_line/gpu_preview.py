@@ -1,4 +1,4 @@
-"""Experimental Solid-view GPU edge classification, projection and depth testing.
+"""GPU edge classification, projection and mesh centerline depth testing.
 
 Blender mesh/depsgraph access stays on the main thread. View-independent edge
 adjacency is uploaded once; camera movement changes shader uniforms only.
@@ -142,7 +142,10 @@ def sync(scene):
         with bpy.context.temp_override(window=window):dg = bpy.context.evaluated_depsgraph_get()
         groups = []
         source_ids = set()
-        needs_depth=any(getattr(n,'_gpu_hidden',False) for n,b,t in jobs)
+        # The viewport depth buffer can reject the expanded stroke quad against
+        # its own sloping surface. Classify the centerline against our unjittered
+        # mesh depth in every shading mode, then draw the whole stroke as overlay.
+        needs_depth=True
         for node, brush, targets in jobs:
             pieces = []; extra_pieces=[];extra_offset=0
             map_pieces=[];chain_vertices=[];chain_ends=[];vertex_offset=0
@@ -197,7 +200,7 @@ def sync(scene):
         from . import curves,preview_runtime
         curves.mark_synced(scene);preview_runtime.mark_synced(scene)
     finally:_building = False
-    return ['GPU 시험 미리보기: Solid · 곡선/점선/맵/숨은 선. 분기점은 선을 나누며 루프 시작·위상·연결부·AA는 Native와 다릅니다']
+    return ['GPU 시험 미리보기: Solid/재질 미리보기 · 곡선/점선/맵/숨은 선. 분기점은 선을 나누며 루프 시작·위상·연결부·AA는 Native와 다릅니다']
 
 
 VERTEX = r'''
@@ -261,6 +264,18 @@ FRAGMENT = r'''
 float reduction(vec4 spec,float distanceValue) {
     return mix(1.0,mix(1.0,spec.z,clamp((distanceValue-spec.x)/max(0.000001,spec.y-spec.x),0.0,1.0)),spec.w);
 }
+float centerDepth(vec2 center) {
+    // Depth texels are located at pixel centers. Interpolate at the actual
+    // projected centerline, rather than shifting it to the next half pixel.
+    // Nearest sampling can classify an edge as behind its own sloping face.
+    vec2 p=center-vec2(.5), f=fract(p);ivec2 a=ivec2(floor(p));
+    ivec2 last=textureSize(sceneDepth,0)-1;
+    float d00=texelFetch(sceneDepth,clamp(a,ivec2(0),last),0).r;
+    float d10=texelFetch(sceneDepth,clamp(a+ivec2(1,0),ivec2(0),last),0).r;
+    float d01=texelFetch(sceneDepth,clamp(a+ivec2(0,1),ivec2(0),last),0).r;
+    float d11=texelFetch(sceneDepth,clamp(a+ivec2(1,1),ivec2(0),last),0).r;
+    return mix(mix(d00,d10,f.x),mix(d01,d11,f.x),f.y);
+}
 void main() {
     float t=clamp(lineCoord.x/max(segmentLength,0.00001),0.0,1.0);
     float u=t*inverseW.y/max(mix(inverseW.x,inverseW.y,t),1e-20);
@@ -282,8 +297,8 @@ void main() {
     float opacity=inkColor.a*distanceAlpha*alphaCurve;
     vec3 color=styleValue(8).x>.5?mix(inkColor.rgb,colorMap.rgb,modes.z*colorMap.a):inkColor.rgb;
     if(modes.x>.5){
-        vec2 center=mix(screenEnds.xy,screenEnds.zw,t);ivec2 size=textureSize(sceneDepth,0);
-        float scene=texelFetch(sceneDepth,clamp(ivec2(center),ivec2(0),size-1),0).r;
+        vec2 center=mix(screenEnds.xy,screenEnds.zw,t);
+        float scene=centerDepth(center);
         vec4 clip=viewProjection*vec4(mix(worldA,worldB,u),1);float depth=clip.z/clip.w*.5+.5;
         bool hidden=depth>scene+.000002;
         if((modes.x>1.5)!=hidden)discard;
@@ -362,7 +377,9 @@ def _draw():
     if scene is None or not getattr(scene, 'lea_line', None) or not scene.lea_line.preview_enabled:return
     entry = _states.get(scene.as_pointer())
     if not entry or entry['error'] or bpy.app.is_job_running('RENDER'):return
-    if context.space_data.shading.type != 'SOLID' or context.space_data.shading.show_xray:return
+    shading=context.space_data.shading
+    if shading.type not in {'SOLID','MATERIAL'}:return
+    if shading.type=='SOLID' and shading.show_xray:return
     # Always use the current region's matrices, including during navigation,
     # after leaving camera view, and in additional View3D areas. No helper is
     # needed: the scene camera remains solely a final-render setting.

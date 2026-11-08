@@ -230,7 +230,7 @@ def draw_actions(layout, context, tree=None):
         from . import free_view
         entry=free_view._entries.get(context.scene.as_pointer())
         if gpu_live:
-            layout.label(text='이동 중에도 선 유지 · Solid / X-Ray 끔',icon='INFO')
+            layout.label(text='이동 중 선 유지 · Solid / 재질 미리보기',icon='INFO')
             layout.label(text='곡선 · 점선 · 맵 · 숨은 선 (GPU)',icon='INFO')
             layout.label(text='Native와 시작점·연결부·AA 차이 있음',icon='INFO')
         else:
