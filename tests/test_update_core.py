@@ -15,6 +15,13 @@ spec.loader.exec_module(core)
 
 class Updates(unittest.TestCase):
     def setUp(self):
+        self.assertTrue(core.process_alive(os.getpid()))
+        self.alive = patch.object(core, 'process_alive', return_value=False)
+        self.alive.start()
+        self.addCleanup(self.alive.stop)
+        self.others = patch.object(core, 'other_blender_running', return_value=False)
+        self.others.start()
+        self.addCleanup(self.others.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.zip = self.root / 'new.zip'
@@ -76,5 +83,17 @@ class Updates(unittest.TestCase):
     def test_target_mismatch_ignored(self):
         core.stage(self.zip,self.release,self.config,self.target,pid=10)
         self.assertFalse(core.apply_pending(self.config,self.root/'other',pid=11))
+
+    def test_other_process_waits_for_origin_to_exit(self):
+        core.stage(self.zip,self.release,self.config,self.target,pid=10)
+        with patch.object(core,'process_alive',return_value=True):
+            self.assertFalse(core.apply_pending(self.config,self.target,pid=11))
+        self.assertIn('old',(self.target/'__init__.py').read_text())
+
+    def test_unrelated_blender_also_defers_install(self):
+        core.stage(self.zip,self.release,self.config,self.target,pid=10)
+        with patch.object(core,'other_blender_running',return_value=True):
+            self.assertFalse(core.apply_pending(self.config,self.target,pid=11))
+        self.assertIn('old',(self.target/'__init__.py').read_text())
 
 if __name__=='__main__':unittest.main()

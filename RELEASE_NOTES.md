@@ -1,11 +1,12 @@
-0.28.7 — GitHub 업데이트 기능·공개 다운로드 검증
+0.28.8 — GitHub 업데이트·여러 Blender 실행 보호
 
 - REA Pencil Line 패널과 애드온 환경설정에 업데이트 확인·다운로드 버튼을 추가했습니다.
 - 공식 정식 배포본의 SHA-256과 제품·버전·Blender 호환성을 확인합니다.
 - GitHub 공개 Asset API로 다운로드해 브라우저 다운로드 경로의 게이트웨이 오류를 피합니다.
 - 현재 세션의 DLL을 덮어쓰지 않고 Blender 재시작 시 적용합니다. 이전 설치 폴더를 백업하고 교체 실패 시 복구합니다.
+- Blender를 여러 개 실행하더라도 업데이트를 준비한 프로세스가 종료되기 전에는 교체하지 않습니다.
 - 0.28.5 사용자는 이 ZIP을 한 번 수동 설치해야 합니다. 이후 새 정식 버전은 버튼으로 준비할 수 있습니다.
 
-Blender 4.4용 Legacy Add-on입니다. 설치 ZIP은 `rea_pencil_for_blender-0.28.7.zip`이며, GitHub Source code ZIP은 설치용이 아닙니다.
+Blender 4.4용 Legacy Add-on입니다. 설치 ZIP은 `rea_pencil_for_blender-0.28.8.zip`이며, GitHub Source code ZIP은 설치용이 아닙니다.
 
 이번 버전의 렌더링 계산과 Rust DLL은 0.28.5와 같습니다. 0.29.0 실험용 AA 코드는 포함하지 않았습니다. Normal 스탬프의 최종 렌더에서 반투명이 더 진해지는 문제는 아직 남아 있습니다. 원본 Pencil+와 기능·화질·속도 동등성을 주장하지 않습니다.

@@ -86,7 +86,7 @@ def draw(layout, context):
     try:
         value = update_core.pending(directory())
         if value and value.get('state') == 'ready':
-            box.label(text='Blender를 종료하고 다시 실행하면 적용됩니다', icon='INFO')
+            box.label(text='모든 Blender를 종료한 후 다시 실행해 주세요', icon='INFO')
     except (OSError, ValueError):
         pass
 

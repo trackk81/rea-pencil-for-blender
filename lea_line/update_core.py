@@ -139,6 +139,74 @@ def stage(path, release, directory, target, pid=None):
     write_json(Path(directory) / 'pending.json', pending)
     return pending
 
+def process_alive(pid):
+    """Read-only process query; never use os.kill on Windows."""
+    if not isinstance(pid, int) or pid <= 0:
+        return True
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() != 87
+        try:
+            code = wintypes.DWORD()
+            return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+def other_blender_running(current_pid):
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        class Entry(ctypes.Structure):
+            _fields_ = [('size', wintypes.DWORD), ('usage', wintypes.DWORD), ('pid', wintypes.DWORD),
+                        ('heap', ctypes.c_size_t), ('module', wintypes.DWORD), ('threads', wintypes.DWORD),
+                        ('parent', wintypes.DWORD), ('priority', wintypes.LONG), ('flags', wintypes.DWORD),
+                        ('exe', wintypes.WCHAR * 260)]
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel.Process32FirstW.argtypes = kernel.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(Entry))
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.CreateToolhelp32Snapshot(2, 0)
+        if handle == wintypes.HANDLE(-1).value:
+            return True
+        try:
+            entry = Entry();entry.size = ctypes.sizeof(Entry)
+            ok = kernel.Process32FirstW(handle, ctypes.byref(entry))
+            if not ok:
+                return True
+            while ok:
+                if entry.pid != current_pid and entry.exe.casefold() == 'blender.exe':
+                    return True
+                ok = kernel.Process32NextW(handle, ctypes.byref(entry))
+            return False
+        finally:
+            kernel.CloseHandle(handle)
+    import subprocess
+    try:
+        result = subprocess.run(['ps', '-A', '-o', 'pid=,comm='], capture_output=True, text=True, timeout=3, check=True)
+        for line in result.stdout.splitlines():
+            fields = line.strip().split(None, 1)
+            if len(fields) == 2 and int(fields[0]) != current_pid and Path(fields[1]).name.casefold() == 'blender':
+                return True
+        return False
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return True
+
 def apply_pending(directory, target, pid=None):
     """Swap only after the staging process exits; keep the previous folder intact."""
     marker = Path(directory) / 'pending.json'
@@ -149,6 +217,10 @@ def apply_pending(directory, target, pid=None):
     if pending.get('state') != 'ready' or pending.get('pid') == (os.getpid() if pid is None else pid):
         return False
     if Path(pending['target']).resolve() != target:
+        return False
+    if process_alive(pending.get('pid')):
+        return False
+    if other_blender_running(os.getpid() if pid is None else pid):
         return False
     path = Path(pending['zip'])
     if hashlib.sha256(path.read_bytes()).hexdigest() != pending['sha256']:
