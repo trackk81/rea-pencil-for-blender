@@ -85,6 +85,17 @@ def update(scene,area,region):
     entry['dimensions']=(max(1,region.width),max(1,region.height));entry['signature']=flat
     return True
 
+def refresh(scene):
+    """Refresh the Native helper when leaving the GPU uniform-only path."""
+    entry=_entries.get(scene.as_pointer())
+    if not entry:return
+    area=next((a for w in bpy.context.window_manager.windows for a in w.screen.areas
+               if a.as_pointer()==entry['area'] and a.type=='VIEW_3D'),None)
+    if area:
+        region=next((r for r in area.regions if r.type=='WINDOW'),None)
+        if region:update(scene,area,region)
+
+
 def tick():
     if bpy.app.is_job_running('RENDER'):return .1
     existing={s.as_pointer():s for s in bpy.data.scenes}
@@ -104,6 +115,12 @@ def tick():
         if area is None or not scene.lea_line.preview_enabled:
             stop(scene);continue
         region=next((r for r in area.regions if r.type=='WINDOW'),None)
+        from . import gpu_preview
+        if gpu_preview.active(scene):
+            # POST_VIEW reads this region's actual matrices. No helper-camera
+            # writes, Line Art evaluation or topology uploads on navigation.
+            if area.spaces.active.region_3d.view_perspective=='CAMERA':stop(scene)
+            continue
         if region and area.spaces.active.region_3d.view_perspective=='CAMERA':
             stop(scene)
             from . import viewport
@@ -158,9 +175,10 @@ class LEA_OT_follow_view(bpy.types.Operator):
         cam=bpy.data.objects.new('.rea free view camera',data);cam[TAG]=True;cam['rea_pencil_preview']=True
         scene.collection.objects.link(cam);cam.hide_render=True;cam.hide_viewport=True
         _entries[scene.as_pointer()]={'camera':cam,'area':area.as_pointer(),'dimensions':(region.width,region.height)}
-        scene.lea_line.preview_enabled=True;update(scene,area,region)
-        from . import viewport
-        viewport.sync_preview(scene)
+        if not scene.lea_line.preview_enabled:scene.lea_line.preview_enabled=True
+        update(scene,area,region)
+        from . import viewport,gpu_preview
+        if not gpu_preview.active(scene):viewport.sync_preview(scene)
         if not bpy.app.timers.is_registered(tick):bpy.app.timers.register(tick,first_interval=1/30)
         return {'FINISHED'}
 

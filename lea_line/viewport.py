@@ -93,6 +93,8 @@ def _remove_object(scene, obj):
 
 def clear_preview(scene):
     """Remove only data explicitly tagged as this scene's preview assets."""
+    from . import gpu_preview
+    gpu_preview.stop(scene)
     preview_material.cleanup(scene)
     owner = scene.get(OWNER_SCENE_KEY)
     if not owner:
@@ -172,6 +174,17 @@ def sync_preview(scene, material_render=False):
     if tree is None:
         clear_preview(scene)
         return []
+    from . import gpu_preview
+    gpu_warning = []
+    if getattr(scene.lea_line,'preview_compute','NATIVE')=='GPU' and not material_render:
+        try:
+            gpu_preview._jobs(scene)  # Validate before removing the Native fallback.
+            clear_preview(scene)
+            return gpu_preview.sync(scene)
+        except Exception as exc:
+            gpu_warning = ['GPU 경로를 사용할 수 없어 Native 사용: '+str(exc)]
+    if gpu_preview.active(scene) and not material_render:free_view.refresh(scene)
+    gpu_preview.stop(scene)
     specifications = backend._specifications(tree)
     if free_view.camera(scene) is None:
         clear_preview(scene)
@@ -181,7 +194,7 @@ def sync_preview(scene, material_render=False):
         return ["Live preview supports perspective and orthographic scene cameras."]
     owner = _owner(scene)
     desired = set()
-    warnings = ['Live preview uses native Line Art; chaining and antialiasing differ from final Freestyle lines.']
+    warnings = gpu_warning + ['Live preview uses native Line Art; chaining and antialiasing differ from final Freestyle lines.']
     for index, (node, brush) in enumerate(specifications):
         if free_view.dimensions(scene) and (material_scope.active(node) or node.use_material_functions):
             raise ValueError('Free View material-face evaluation is not yet verified; select Scene Camera')

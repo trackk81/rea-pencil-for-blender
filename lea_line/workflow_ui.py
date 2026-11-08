@@ -218,11 +218,17 @@ def draw_actions(layout, context, tree=None):
     views.operator('lea_line.follow_view',text='Follow Viewport').enabled=True
     views.operator('lea_line.follow_view',text='Scene Camera').enabled=False
     row.operator('lea_line.render', text='Render', icon='RENDER_STILL')
+    layout.prop(settings,'preview_compute',text='뷰포트 계산')
     if settings.preview_enabled:
         from . import free_view
         entry=free_view._entries.get(context.scene.as_pointer())
         layout.label(text='자유 시점 추적 중' if entry else '카메라 기준 미리보기 · Numpad 0', icon='CAMERA_DATA')
-        if entry:
+        from . import gpu_preview
+        if gpu_preview.active(context.scene):
+            layout.label(text='GPU · Solid 기본 실선 · AA 차이 있음',icon='INFO')
+        elif settings.preview_compute=='GPU':
+            layout.label(text='GPU 미지원 설정 · Native 경로 사용',icon='ERROR')
+        if entry and not gpu_preview.active(context.scene):
             layout.prop(settings,'follow_refresh_mode',text='갱신 방식')
             if settings.follow_refresh_mode=='SETTLED':
                 layout.label(text='이동 중 선 숨김 · 멈추면 자동 갱신',icon='INFO')
