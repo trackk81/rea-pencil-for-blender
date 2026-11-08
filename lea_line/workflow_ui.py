@@ -4,6 +4,77 @@ from bpy.props import EnumProperty, StringProperty
 from . import ui, backend
 
 
+def _camera_view(context):
+    """Prefer the followed view, then the current/adjacent View3D."""
+    from . import free_view
+    followed = free_view._entries.get(context.scene.as_pointer(), {}).get('area')
+    views = [(window, area) for window in context.window_manager.windows
+             if window.scene == context.scene for area in window.screen.areas if area.type == 'VIEW_3D']
+    return next((item for item in views if item[1].as_pointer() == followed), None) or next(
+        (item for item in views if item[1] == context.area), None) or next(
+        (item for item in views if item[0] == context.window), None) or (views[0] if views else None)
+
+
+class LEA_OT_create_camera(bpy.types.Operator):
+    bl_idname = 'lea_line.create_camera'
+    bl_label = '카메라 자동 생성'
+    bl_description = '현재 3D 뷰 시점으로 장면 카메라를 만듭니다. 3D 뷰가 없으면 장면의 메시를 바라봅니다'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene and context.scene.is_editable and not bpy.app.is_job_running('RENDER'))
+
+    def execute(self, context):
+        scene = context.scene
+        if scene.camera is not None:
+            self.report({'INFO'}, '기존 장면 카메라를 유지합니다')
+            return {'FINISHED'}
+        from mathutils import Vector
+        view = _camera_view(context)
+        data = bpy.data.cameras.new('REA Camera')
+        camera = None
+        try:
+            camera = bpy.data.objects.new('REA Camera', data)
+            scene.collection.objects.link(camera)
+            if view:
+                space = view[1].spaces.active
+                region_view = space.region_3d
+                projection = region_view.window_matrix
+                camera.matrix_world = region_view.view_matrix.inverted()
+                data.type = 'PERSP' if region_view.is_perspective else 'ORTHO'
+                data.sensor_fit = 'VERTICAL'
+                data.sensor_height = 36
+                data.lens = max(1., min(5000., 18 * projection[1][1]))
+                data.ortho_scale = 2 / max(1e-10, projection[1][1])
+                data.clip_start, data.clip_end = space.clip_start, space.clip_end
+            else:
+                points = [obj.matrix_world @ Vector(corner) for obj in scene.objects
+                          if obj.type == 'MESH' and not obj.hide_render and not obj.get('rea_pencil_preview')
+                          for corner in obj.bound_box]
+                low = Vector(tuple(min(p[i] for p in points) for i in range(3))) if points else Vector((-1,-1,-1))
+                high = Vector(tuple(max(p[i] for p in points) for i in range(3))) if points else Vector((1,1,1))
+                center = (low + high) * .5
+                radius = max(1., (high - low).length * .5)
+                camera.location = center + Vector((1., -1., .75)).normalized() * max(8., radius * 4)
+                camera.rotation_euler = (center - camera.location).to_track_quat('-Z', 'Y').to_euler()
+                data.clip_end = max(1000., radius * 20)
+            scene.camera = camera
+        except Exception as exc:
+            if scene.camera == camera:
+                scene.camera = None
+            if camera is not None:
+                bpy.data.objects.remove(camera, do_unlink=True)
+            if data.users == 0:
+                bpy.data.cameras.remove(data)
+            self.report({'ERROR'}, '카메라 생성 실패: ' + str(exc))
+            return {'CANCELLED'}
+        # Object selection, viewport orientation and render resolution are preserved.
+        ui._sync_if_enabled(scene.lea_line, context)
+        self.report({'INFO'}, '미리보기·렌더용 장면 카메라를 만들었습니다')
+        return {'FINISHED'}
+
+
 def tree_from(context, name=''):
     if name:
         tree = bpy.data.node_groups.get(name)
@@ -151,7 +222,8 @@ def draw_actions(layout, context, tree=None):
         from . import free_view
         layout.label(text='자유 시점 추적 중' if context.scene.as_pointer() in free_view._entries else '카메라 기준 미리보기 · Numpad 0', icon='CAMERA_DATA')
     if context.scene.camera is None:
-        layout.label(text='미리보기와 렌더에는 장면 카메라가 필요합니다', icon='INFO')
+        layout.operator('lea_line.create_camera', text='카메라 자동 생성', icon='OUTLINER_OB_CAMERA')
+        layout.label(text='미리보기·렌더용 카메라를 만듭니다', icon='INFO')
 
 
 def draw_start(layout, context):
@@ -227,7 +299,7 @@ class LEA_PT_workflow_options(bpy.types.Panel):
                 layout.label(text=line, icon='INFO')
 
 
-CLASSES = (LEA_OT_line_list_action, LEA_OT_open_line_editor, LEA_PT_workflow_tools, LEA_PT_workflow_options)
+CLASSES = (LEA_OT_create_camera, LEA_OT_line_list_action, LEA_OT_open_line_editor, LEA_PT_workflow_tools, LEA_PT_workflow_options)
 
 
 def register():
