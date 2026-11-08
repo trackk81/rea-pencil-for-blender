@@ -13,6 +13,8 @@ import numpy as np
 from mathutils import Vector
 
 LAST_RESULT = {}
+_capture_requested = False
+_captured_pixels = None
 _grease_pencil_scopes = {}
 
 
@@ -58,9 +60,9 @@ def _restore_all(*args):
     _grease_pencil_scopes.clear()
 
 
-def render_lines(scene, *, write_still=False):
+def render_lines(scene, *, write_still=False, capture=False):
     """Run the independent engine and restore the caller's render settings."""
-    global LAST_RESULT
+    global LAST_RESULT, _capture_requested, _captured_pixels
     from . import ui
     flags = {name: getattr(scene.render, name) for name in
              ('engine', 'use_freestyle', 'use_compositing', 'use_sequencer')}
@@ -71,6 +73,9 @@ def render_lines(scene, *, write_still=False):
     grease_pencils = []
     started = time.perf_counter()
     LAST_RESULT = {}
+    previous_capture = _capture_requested
+    _capture_requested = capture
+    _captured_pixels = None
     try:
         with ui.suspend_sync():
             scene.lea_line.auto_sync = False
@@ -84,9 +89,16 @@ def render_lines(scene, *, write_still=False):
             return {'status': 'cancelled', 'seconds': time.perf_counter()-started}
         if LAST_RESULT.get('status') != 'ok':
             raise RuntimeError(LAST_RESULT.get('message', 'GPU line render did not complete'))
-        return dict(LAST_RESULT, seconds=time.perf_counter()-started, warnings=[
+        result = dict(LAST_RESULT, seconds=time.perf_counter()-started, warnings=[
             '독립 GPU 선 렌더 · 메시 불투명 가림 판정 · 원본과 선 연결부/AA가 다릅니다'])
+        if capture:
+            if _captured_pixels is None:
+                raise RuntimeError('GPU line image was not captured')
+            result['pixels'] = _captured_pixels
+        return result
     finally:
+        _capture_requested = previous_capture
+        _captured_pixels = None
         _restore_grease_pencils(grease_pencils)
         for name, value in flags.items():
             setattr(scene.render, name, value)
@@ -174,7 +186,7 @@ class REA_GPU_LINE_ENGINE(bpy.types.RenderEngine):
     bl_use_custom_freestyle = True
 
     def render(self, depsgraph):
-        global LAST_RESULT
+        global LAST_RESULT, _captured_pixels
         from . import gpu_preview
         start = time.perf_counter()
         scene = depsgraph.scene_eval
@@ -209,6 +221,8 @@ class REA_GPU_LINE_ENGINE(bpy.types.RenderEngine):
             publish(result.layers[0], rgba)
             self.end_result(result)
             result = None
+            if _capture_requested:
+                _captured_pixels = rgba
             LAST_RESULT = {'status': 'ok', 'depsgraph_mode': depsgraph.mode,
                 'prepare_seconds': prepared-start, 'GPU_draw_readback_seconds': drawn-prepared,
                 'engine_seconds': time.perf_counter()-start, 'edges': entry['edges'],

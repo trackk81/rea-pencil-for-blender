@@ -598,12 +598,7 @@ def _draw_output_settings(context, layout, tree, runtime=False):
             layout.prop(settings, 'reference_height')
         return
     layout.prop(settings, 'auto_sync')
-    layout.prop(settings, 'fast_line_art', text='Line Art Render')
-    if settings.fast_line_art:
-        layout.prop(settings, 'stroke_width_profile', text='Coverage')
-        layout.prop(settings, 'line_art_aa', text='Antialiasing')
-    else:
-        layout.prop(settings, 'reuse_line_pass', text='Reuse Line Pass')
+    layout.label(text='Render: GPU lines + scene')
     preview = layout.row(align=True)
     preview.use_property_split = False
     preview.prop(settings, 'preview_enabled', text='Live Preview')
@@ -615,8 +610,7 @@ def _draw_output_settings(context, layout, tree, runtime=False):
     row = layout.row(align=True)
     row.operator('lea_line.apply', text='Apply', icon='FILE_REFRESH')
     row.operator('lea_line.render', text='Render', icon='RENDER_STILL')
-    if settings.fast_line_art:
-        layout.label(text='F12 uses Freestyle', icon='INFO')
+    layout.label(text='Use the REA Render button for GPU lines', icon='INFO')
 
 
 def _draw_runtime_panel(context, layout, tree):
@@ -1483,53 +1477,24 @@ class LEA_OT_add_line_set(bpy.types.Operator):
 
 class LEA_OT_render(bpy.types.Operator):
     bl_idname = "lea_line.render"
-    bl_label = "Render with Lines"
-    bl_description = "Apply line settings and render the current scene"
+    bl_label = "Render with GPU Lines"
+    bl_description = "장면과 독립 GPU 선을 합성합니다. 기존 Line Art 선은 중복되지 않도록 렌더 중만 제외합니다"
 
     def execute(self, context):
-        from . import backend
-        if context.scene.camera is None:
-            self.report({"ERROR"}, "Set a scene camera before rendering")
-            return {"CANCELLED"}
-        if context.scene.lea_line.tree is None:
-            self.report({"ERROR"}, "Create a Line Graph before rendering")
-            return {"CANCELLED"}
+        from . import gpu_composite
         try:
-            warnings = backend.sync_scene(context.scene)
+            result = gpu_composite.render(context.scene)
         except Exception as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        if warnings:
-            self.report({"WARNING"}, "; ".join(warnings))
-        if context.scene.lea_line.fast_line_art:
-            from . import fast_render
-            try:
-                result = fast_render.render(context.scene, write_still=False)
-            except Exception as exc:
-                self.report({'ERROR'}, str(exc))
-                return {'CANCELLED'}
-            label = "Freestyle fallback" if result.get('mode') == 'FREESTYLE_FALLBACK' else "Fast Line Art"
-            message = f"{label}: {result['seconds']:.3f} s"
-            if result.get('warnings'):
-                message += '; ' + '; '.join(result['warnings'])
-            context.scene.lea_line.last_render_seconds = result['seconds']
-            context.scene.lea_line.last_message = message
-            self.report({'INFO'}, message)
-        elif context.scene.lea_line.reuse_line_pass:
-            from . import render_cache
-            try:
-                result = render_cache.render(context.scene)
-            except Exception as exc:
-                self.report({'ERROR'}, str(exc))
-                return {'CANCELLED'}
-            message = f"Line cache: {result['cache']}; {result['seconds']:.3f} s"
-            if result.get('reason'):
-                message += '; ' + result['reason']
-            context.scene.lea_line.last_message = message
-            self.report({'INFO'}, message)
-        else:
-            bpy.ops.render.render("INVOKE_DEFAULT")
-        return {"FINISHED"}
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        if result['status'] == 'cancelled':
+            return {'CANCELLED'}
+        context.scene.lea_line.last_render_seconds = result['seconds']
+        context.scene.lea_line.last_message = f"GPU 선 합성 렌더: {result['seconds']:.3f}s"
+        self.report({'INFO'}, context.scene.lea_line.last_message)
+        if not bpy.app.background:
+            bpy.ops.render.view_show('INVOKE_DEFAULT')
+        return {'FINISHED'}
 
 
 class LEA_OT_render_lines(bpy.types.Operator):
