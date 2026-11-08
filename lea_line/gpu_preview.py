@@ -27,46 +27,34 @@ def stats(scene):
 
 
 def _jobs(scene):
-    from . import backend, routing, material_scope, texture_maps, stroke_variation
+    from . import backend, routing, material_scope, stroke_variation,gpu_styles
     if len(scene.view_layers)!=1:
         raise ValueError('GPU 시험 경로는 단일 뷰 레이어만 지원합니다')
     jobs = []
     for node, common in backend._specifications(scene.lea_line.tree):
-        if node.hidden or node.intersection or node.ridge_valley or node.suggestive_contour:
-            raise ValueError('GPU: 기본 보이는 선만 지원합니다. 숨은 선·교차선·곡면 특수선은 Native를 사용하세요')
         if material_scope.active(node) or node.use_material_functions:
             raise ValueError('GPU: 재질별 얼굴 선택·Line Functions는 Native를 사용하세요')
-        if not node.visible:
-            continue
-        brush, deferred = routing.live_brush(node, common, 'VISIBLE')
-        if deferred or texture_maps.maps(brush) or stroke_variation.snapshot(brush) is not None:
-            raise ValueError('GPU: 맵·랜덤·혼합 브러시는 Native를 사용하세요')
-        if getattr(brush, 'brush_type', 'SIMPLE') == 'MULTIPLE' or getattr(brush, 'brush_map_on', False):
-            raise ValueError('GPU: 다중 스탬프·브러시 맵은 Native를 사용하세요')
-        if any(getattr(brush, key, False) for key in ('dashed', 'taper', 'size_curve_enabled',
-                'alpha_curve_enabled', 'distortion_enabled', 'distortion_map_on')):
-            raise ValueError('GPU: 점선·굵기/알파 곡선·왜곡은 Native를 사용하세요')
-        if any(getattr(brush, key, 0) for key in ('min_line_length', 'extend', 'offset_x', 'offset_y', 'normal_offset')):
-            raise ValueError('GPU: 길이 제한·선 오프셋은 Native를 사용하세요')
-        if getattr(brush, 'caps', 'ROUND') != 'ROUND' or getattr(brush, 'hidden_mask_objects', ()):
-            raise ValueError('GPU: Round 캡 기본 실선만 지원합니다')
-        if getattr(brush, 'distance_reference_enabled', False) or getattr(brush, 'distance_curve_table', None):
-            raise ValueError('GPU: 거리 참조·거리 곡선은 Native를 사용하세요')
-        channels = getattr(brush, 'distance_channels', {})
-        if any(c.get('reference') or c.get('profile') is not None for c in channels.values()):
-            raise ValueError('GPU: 독립 거리 참조·곡선은 Native를 사용하세요')
-        # Non-default Normal stamp shaping cannot be represented by a solid edge.
-        if (abs(getattr(brush, 'stretch', 0.)) > 1e-6 or getattr(brush, 'groove', 0.)
-                or abs(getattr(brush, 'stamp_reduction_start', 1.)-1.) > 1e-6
-                or abs(getattr(brush, 'stamp_reduction_end', 1.)-1.) > 1e-6):
-            raise ValueError('GPU: 스탬프 변형은 Native를 사용하세요')
         collection = backend.source_collection(scene, node)
         targets = set(collection.all_objects) if collection else set(scene.objects)
-        jobs.append((node, brush, targets))
+        for visibility,enabled in (('VISIBLE',node.visible),('HIDDEN',node.hidden)):
+            if not enabled:continue
+            if any(routing.feature_enabled(node,k,visibility) for k in ('intersection','ridge_valley','suggestive_contour')):
+                raise ValueError('GPU: 교차선·곡면 특수선은 Native를 사용하세요')
+            brush,deferred=routing.live_brush(node,common,visibility)
+            if deferred or stroke_variation.snapshot(brush) is not None:raise ValueError('GPU: 랜덤·혼합 브러시는 Native를 사용하세요')
+            gpu_styles.validate(brush)
+            if getattr(brush,'brush_type','SIMPLE')=='MULTIPLE' or getattr(brush,'brush_map_on',False):raise ValueError('GPU: 다중 스탬프·브러시 맵은 Native를 사용하세요')
+            if any(getattr(brush,k,False) for k in ('distortion_enabled','distortion_map_on')):raise ValueError('GPU: 왜곡은 Native를 사용하세요')
+            if any(getattr(brush,k,0) for k in ('min_line_length','extend','offset_x','offset_y','normal_offset')):raise ValueError('GPU: 길이 제한·선 오프셋은 Native를 사용하세요')
+            if getattr(brush,'caps','ROUND')!='ROUND' or getattr(brush,'hidden_mask_objects',()):raise ValueError('GPU: Round 캡만 지원하며 숨은 선 마스크는 Native를 사용하세요')
+            if (abs(getattr(brush,'stretch',0.))>1e-6 or getattr(brush,'groove',0.) or abs(getattr(brush,'stamp_reduction_start',1.)-1.)>1e-6 or abs(getattr(brush,'stamp_reduction_end',1.)-1.)>1e-6):raise ValueError('GPU: 스탬프 변형은 Native를 사용하세요')
+            proxy=routing.ResolvedBrush(node,{k:routing.feature_enabled(node,k,visibility) for k in ('outline','border','crease','edge_mark','material_boundary')})
+            proxy.overrides['_gpu_hidden']=visibility=='HIDDEN'
+            jobs.append((proxy,brush,targets))
     return jobs
 
 
-def _records(mesh, matrix, node):
+def _records(mesh, matrix, node, payload=None):
     """Vectorized topology preparation; no view-dependent edge selection here."""
     nv, ne, npoly, nl = len(mesh.vertices), len(mesh.edges), len(mesh.polygons), len(mesh.loops)
     if not nv or not ne or not npoly:
@@ -123,6 +111,8 @@ def _records(mesh, matrix, node):
     result[:, 1, :3] = world[endpoints[:, 1]]; result[:, 1, 3] = silhouette[chosen]
     result[:, 2, :3] = n0[chosen]; result[:, 3, :3] = n1[chosen]
     result[:, 2, 3]=extra_start[chosen];result[:, 3, 3]=extra_count[chosen]
+    if payload is not None:
+        payload.update(world_vertices=world,endpoints=endpoints,chosen_mask=chosen,loop_edges=loop_edges,face_counts=counts[chosen])
     return result, np.asarray(extra,dtype=np.float32).reshape(-1,4)
 
 
@@ -140,7 +130,7 @@ def sync(scene):
     global _handle, _building
     if bpy.app.background:
         raise ValueError('GPU 미리보기는 Blender 창에서 사용하세요')
-    from . import backend
+    from . import backend,gpu_styles,gpu_depth
     from . import free_view
     followed=free_view._entries.get(scene.as_pointer())
     if followed:free_view._restore_navigation(followed)
@@ -152,8 +142,11 @@ def sync(scene):
         with bpy.context.temp_override(window=window):dg = bpy.context.evaluated_depsgraph_get()
         groups = []
         source_ids = set()
+        needs_depth=any(getattr(n,'_gpu_hidden',False) for n,b,t in jobs)
         for node, brush, targets in jobs:
             pieces = []; extra_pieces=[];extra_offset=0
+            map_pieces=[];chain_vertices=[];chain_ends=[];vertex_offset=0
+            style=gpu_styles.snapshot(brush,backend.width_scale(scene,node),getattr(node,'_gpu_hidden',False),needs_depth)
             for instance in dg.object_instances:
                 obj = instance.object
                 parent=instance.parent.original if instance.is_instance and instance.parent else None
@@ -163,7 +156,13 @@ def sync(scene):
                     continue
                 mesh = obj.to_mesh()
                 try:
-                    records,extra=_records(mesh, instance.matrix_world, node)
+                    payload={};records,extra=_records(mesh, instance.matrix_world, node,payload)
+                    if len(records):
+                        mapped=gpu_styles.mesh_maps(mesh,payload,style['maps'])
+                        if mapped is not None:map_pieces.append(mapped)
+                        if style['needs_chain']:
+                            used,inverse=np.unique(payload['endpoints'],return_inverse=True)
+                            chain_vertices.append(payload['world_vertices'][used]);chain_ends.append(inverse.reshape(-1,2)+vertex_offset);vertex_offset+=len(used)
                     records[records[:,3,3]>2,2,3]+=extra_offset
                     pieces.append(records);extra_pieces.append(extra);extra_offset+=len(extra)
                     source_ids.add(obj.original.as_pointer())
@@ -174,16 +173,31 @@ def sync(scene):
             if len(records) > 2_000_000:
                 raise ValueError('GPU 시험 경로의 모서리 메모리 한도를 넘었습니다')
             extra=np.concatenate(extra_pieces) if extra_pieces else np.empty((0,4),np.float32)
+            map_coordinates=np.concatenate(map_pieces) if map_pieces else np.zeros((1,4),np.float32)
+            if 'size' in style['maps'] and style['maps']['size'].source_type=='OBJECTCOLOR' and map_pieces:
+                maximum=float(np.max(map_coordinates[:,4:8,:3]@np.array((.2126,.7152,.0722))))
+                style['params'][3,2]*=max(1.,1-brush.size_map_amount+brush.size_map_amount*maximum)
+            if style['params'][3,2]*brush.thickness*backend.width_scale(scene,node)>512:raise ValueError('GPU: 효과 적용 굵기가 512px를 넘으면 Native를 사용하세요')
             groups.append({'records': records, 'extra_normals':extra, 'texture': None, 'brush': brush,
+                           'style':style,'map_coordinates':map_coordinates,
+                           'chain_vertices':np.concatenate(chain_vertices) if chain_vertices else np.zeros((0,3),np.float32),
+                           'chain_endpoints':np.concatenate(chain_ends) if chain_ends else np.zeros((0,2),np.int32),
                            'width': brush.thickness*backend.width_scale(scene, node),
                            'size_reduction': _channel(brush, 'SIZE'), 'alpha_reduction': _channel(brush, 'ALPHA')})
-        _states[scene.as_pointer()] = {'groups': groups, 'source_ids': source_ids,
+        for group in groups:
+            for obj in group['style']['references']:source_ids.add(obj.as_pointer())
+            for n in group['style']['maps'].values():
+                if getattr(n,'image',None):source_ids.add(n.image.as_pointer())
+        depth_data=gpu_depth.snapshot(dg) if needs_depth else None
+        _states[scene.as_pointer()] = {'groups': groups, 'source_ids': source_ids,'depth':depth_data,
             'edges': sum(len(g['records']) for g in groups), 'build_ms': (time.perf_counter()-start)*1000,
             'draw_ms': 0., 'draws': 0, 'uploads': 0, 'dirty': False, 'error': ''}
         if _handle is None:_handle = bpy.types.SpaceView3D.draw_handler_add(_draw, (), 'WINDOW', 'POST_VIEW')
         if not bpy.app.timers.is_registered(_watch):bpy.app.timers.register(_watch, first_interval=.2)
+        from . import curves,preview_runtime
+        curves.mark_synced(scene);preview_runtime.mark_synced(scene)
     finally:_building = False
-    return ['GPU 시험 미리보기: Solid · 기본 실선/선형 거리 감소. 스탬프·연결부·AA는 Native와 다릅니다']
+    return ['GPU 시험 미리보기: Solid · 곡선/점선/맵/숨은 선. 분기점은 선을 나누며 루프 시작·위상·연결부·AA는 Native와 다릅니다']
 
 
 VERTEX = r'''
@@ -199,6 +213,7 @@ void main() {
     vec4 a=record(edge,0), b=record(edge,1);
     vec3 toEye=perspectiveView!=0 ? eyePosition-a.xyz : viewDirection;
     float f0=dot(record(edge,2).xyz,toEye), f1=dot(record(edge,3).xyz,toEye);
+    edgeIndex=float(edge);faceChoice=(f1>=0.0&&f0<0.0)?1.0:0.0;clipInterval=vec2(0,1);screenEnds=vec4(0);chainSpan=vec3(0);
     bool outline=(f0>=0.0)!=(f1>=0.0);
     int extraCount=int(record(edge,3).w);
     if (a.w<0.5 && b.w>0.5 && extraCount>2) {
@@ -220,15 +235,17 @@ void main() {
         worldA=vec3(0.0);worldB=vec3(0.0);inverseW=vec2(1.0);return;
     }
     vec3 wa=a.xyz, wb=b.xyz;
-    if (pa<=0.0) { float t=pa/(pa-qa); p=mix(p,q,t); wa=mix(wa,wb,t); }
-    else if (qa<=0.0) { float t=qa/(qa-pa); q=mix(q,p,t); wb=mix(wb,wa,t); }
+    if (pa<=0.0) { float t=pa/(pa-qa); p=mix(p,q,t); wa=mix(wa,wb,t);clipInterval.x=t; }
+    else if (qa<=0.0) { float t=qa/(qa-pa); q=mix(q,p,t); wb=mix(wb,wa,t);clipInterval.y=1.0-t; }
     vec2 sa=p.xy/p.w*viewportSize*0.5, sb=q.xy/q.w*viewportSize*0.5;
     vec2 delta=sb-sa; float lengthValue=length(delta);
     vec2 tangent=delta/max(lengthValue,0.00001), normal=vec2(-tangent.y,tangent.x);
-    vec3 span=wb-wa;
-    float closest=clamp(dot(eyePosition-wa,span)/max(dot(span,span),1e-20),0.0,1.0);
-    float distanceValue=length(eyePosition-mix(wa,wb,closest));
-    float halfWidth=max(0.0,lineWidth*reduction(sizeReduction,distanceValue)*0.5);
+    vec3 span=wb-wa;vec4 profiles=texelFetch(styleData,ivec2(14,0),0);
+    vec3 reference=profiles.z>.5?texelFetch(styleData,ivec2(15,0),0).xyz:eyePosition;
+    float closest=clamp(dot(reference-wa,span)/max(dot(span,span),1e-20),0.0,1.0);
+    float distanceValue=length(reference-mix(wa,wb,closest));
+    float boundReduction=profiles.x>.5?1.0:reduction(sizeReduction,distanceValue);
+    float halfWidth=max(0.0,lineWidth*boundReduction*texelFetch(styleData,ivec2(3,0),0).z*0.5);
     float extent=halfWidth+1.0;
     vec2 offset=tangent*mix(-extent,extent,corner.x)+normal*corner.y*extent;
     vec4 pos=mix(p,q,corner.x); pos.xy+=offset*2.0/viewportSize*pos.w;
@@ -236,6 +253,8 @@ void main() {
     gl_Position=pos;
     lineCoord=vec2(mix(-extent,lengthValue+extent,corner.x),corner.y*extent);
     segmentLength=lengthValue;worldA=wa;worldB=wb;inverseW=vec2(1.0/p.w,1.0/q.w);
+    screenEnds=vec4(sa+viewportSize*.5,sb+viewportSize*.5);
+    if(texelFetch(styleData,ivec2(3,0),0).w>.5){int w=textureSize(chainData,0).x;chainSpan=texelFetch(chainData,ivec2(edge%w,edge/w),0).xyz;}
 }
 '''
 FRAGMENT = r'''
@@ -245,14 +264,39 @@ float reduction(vec4 spec,float distanceValue) {
 void main() {
     float t=clamp(lineCoord.x/max(segmentLength,0.00001),0.0,1.0);
     float u=t*inverseW.y/max(mix(inverseW.x,inverseW.y,t),1e-20);
-    float cameraDistance=length(eyePosition-mix(worldA,worldB,u));
-    float radius=max(0.0,lineWidth*reduction(sizeReduction,cameraDistance)*0.5);
-    float opacity=inkColor.a*reduction(alphaReduction,cameraDistance);
+    vec3 world=mix(worldA,worldB,u);float cameraDistance=length(eyePosition-world);
+    vec4 profiles=styleValue(14);
+    float sizeDistance=profiles.z>.5?length(styleValue(15).xyz-world):cameraDistance;
+    float alphaDistance=profiles.w>.5?length(styleValue(16).xyz-world):cameraDistance;
+    float distanceSize=profiles.x>.5&&sizeReduction.w>.5?curveValue(clamp((sizeDistance-sizeReduction.x)/max(.000001,sizeReduction.y-sizeReduction.x),0.0,1.0),2):reduction(sizeReduction,sizeDistance);
+    float distanceAlpha=profiles.y>.5&&alphaReduction.w>.5?curveValue(clamp((alphaDistance-alphaReduction.x)/max(.000001,alphaReduction.y-alphaReduction.x),0.0,1.0),3):reduction(alphaReduction,alphaDistance);
+    vec4 curveOptions=styleValue(3),dashOptions=styleValue(4),modes=styleValue(5);
+    float along=curveOptions.w>.5?mix(chainSpan.x,chainSpan.y,t):clamp(lineCoord.x,0.0,segmentLength);
+    float parameter=curveOptions.w>.5?along/max(chainSpan.z,.00001):t;
+    float sizeCurve=curveOptions.x>.5?curveValue(parameter,0):1.0;
+    float alphaCurve=curveOptions.y>.5?curveValue(parameter,1):1.0;
+    float originalU=mix(clipInterval.x,clipInterval.y,u);
+    vec4 colorMap=mapSample(colorImage,8,0,originalU),sizeMap=mapSample(sizeImage,11,4,originalU);
+    float mapSize=styleValue(11).x>.5?mix(1.0,dot(sizeMap.rgb,vec3(.2126,.7152,.0722))*sizeMap.a,modes.w):1.0;
+    float radius=max(0.0,lineWidth*distanceSize*sizeCurve*mapSize*0.5);
+    float opacity=inkColor.a*distanceAlpha*alphaCurve;
+    vec3 color=styleValue(8).x>.5?mix(inkColor.rgb,colorMap.rgb,modes.z*colorMap.a):inkColor.rgb;
+    if(modes.x>.5){
+        vec2 center=mix(screenEnds.xy,screenEnds.zw,t);ivec2 size=textureSize(sceneDepth,0);
+        float scene=texelFetch(sceneDepth,clamp(ivec2(center),ivec2(0),size-1),0).r;
+        vec4 clip=viewProjection*vec4(mix(worldA,worldB,u),1);float depth=clip.z/clip.w*.5+.5;
+        bool hidden=depth>scene+.000002;
+        if((modes.x>1.5)!=hidden)discard;
+    }
     float outside=max(max(-lineCoord.x,lineCoord.x-segmentLength),0.0);
+    if(dashOptions.x>.5&&dashOptions.z>0.0){
+        float period=max(.00001,dashOptions.y+dashOptions.z),phase=mod(along+dashOptions.w,period);
+        if(phase>dashOptions.y)outside=max(outside,min(phase-dashOptions.y,period-phase));
+    }
     float distanceValue=length(vec2(outside,lineCoord.y));
     float coverage=clamp(radius+0.5-distanceValue,0.0,1.0);
     if (coverage<=0.0 || radius<=0.0 || opacity<=0.0) discard;
-    fragColor=vec4(inkColor.rgb,opacity*coverage);
+    fragColor=vec4(color,opacity*coverage);
 }
 '''
 
@@ -268,10 +312,13 @@ def _resources():
     interface.no_perspective('VEC2', 'lineCoord')
     interface.flat('FLOAT', 'segmentLength')
     interface.flat('VEC3','worldA');interface.flat('VEC3','worldB');interface.flat('VEC2','inverseW')
+    interface.flat('FLOAT','edgeIndex');interface.flat('FLOAT','faceChoice');interface.flat('VEC2','clipInterval')
+    interface.flat('VEC4','screenEnds');interface.flat('VEC3','chainSpan')
     info.vertex_out(interface)
     info.sampler(0, 'FLOAT_2D', 'edgeData')
     info.sampler(1, 'FLOAT_2D', 'extraNormals')
     info.sampler(2, 'FLOAT_2D', 'styleData')
+    for slot,name in enumerate(('curveData','chainData','colorImage','sizeImage','coordinateData','sceneDepth'),3):info.sampler(slot,'FLOAT_2D',name)
     info.typedef_source('''
 #define viewportSize viewportInfo.xy
 #define lineWidth viewportInfo.z
@@ -283,10 +330,11 @@ def _resources():
 #define alphaReduction texelFetch(styleData,ivec2(2,0),0)
 ''')
     # Keep per-view push constants below Blender's portable128-byte minimum.
-    for kind,name in (('MAT4','viewProjection'),('VEC4','viewportInfo'),('VEC4','eyeInfo'),('VEC4','directionInfo')):
+    for kind,name in (('MAT4','viewProjection'),('VEC4','viewportInfo'),('VEC4','eyeInfo'),('VEC4','directionInfo'),('VEC4','viewExtra')):
         info.push_constant(kind,name)
     info.fragment_out(0, 'VEC4', 'fragColor')
-    info.vertex_source(VERTEX); info.fragment_source(FRAGMENT)
+    from . import gpu_styles
+    info.vertex_source(VERTEX); info.fragment_source(gpu_styles.GLSL+FRAGMENT)
     _shader = gpu.shader.create_from_info(info)
     _batch = batch_for_shader(_shader, 'TRIS', {'corner':[(0,-1),(0,1),(1,-1),(1,1)]}, indices=[(0,2,1),(1,2,3)])
 
@@ -305,9 +353,8 @@ def _texture(group):
     data=np.zeros((height*width,4),np.float32);data[:len(extra)]=extra
     group['normal_texture']=gpu.types.GPUTexture((width,height),format='RGBA32F',
         data=gpu.types.Buffer('FLOAT',data.size,data.ravel()))
-    brush=group['brush']
-    values=np.asarray((*brush.color,brush.alpha,*group['size_reduction'],*group['alpha_reduction']),np.float32)
-    group['style_texture']=gpu.types.GPUTexture((3,1),format='RGBA32F',data=gpu.types.Buffer('FLOAT',12,values))
+    from . import gpu_styles
+    gpu_styles.upload(group)
 
 
 def _draw():
@@ -324,20 +371,31 @@ def _draw():
     depth, mask, blend = gpu.state.depth_test_get(), gpu.state.depth_mask_get(), gpu.state.blend_get()
     try:
         _resources()
-        gpu.state.depth_test_set('LESS_EQUAL'); gpu.state.depth_mask_set(False); gpu.state.blend_set('ALPHA')
         view=context.region_data; inverse=view.view_matrix.inverted()
+        from . import gpu_depth,gpu_chain
+        depth_texture=gpu_depth.draw(entry['depth'],view,(context.region.width,context.region.height),context.area.as_pointer()) if entry.get('depth') else None
+        if depth_texture is None:
+            if 'dummy_depth' not in entry:entry['dummy_depth']=gpu.types.GPUTexture((1,1),format='R32F',data=gpu.types.Buffer('FLOAT',1,[1.]))
+            depth_texture=entry['dummy_depth']
+        gpu.state.depth_test_set('NONE' if entry.get('depth') else 'LESS_EQUAL'); gpu.state.depth_mask_set(False); gpu.state.blend_set('ALPHA')
         _shader.bind()
         direction=inverse.to_3x3() @ __import__('mathutils').Vector((0,0,1))
         _shader.uniform_float('viewProjection',view.perspective_matrix)
         _shader.uniform_float('eyeInfo',(*inverse.translation,0.))
         _shader.uniform_float('directionInfo',(*direction,0.))
+        _shader.uniform_float('viewExtra',(*gpu.state.viewport_get()[:2],0.,0.))
+        _shader.uniform_sampler('sceneDepth',depth_texture)
         for group in entry['groups']:
             if not len(group['records']):continue
             if group['texture'] is None:_texture(group);entry['uploads']+=1
+            if group['style']['needs_chain']:
+                gpu_chain.update(group,view.perspective_matrix,(context.region.width,context.region.height,group['width'],int(view.is_perspective)),(*inverse.translation,0.),(*direction,0.),context.area.as_pointer())
+                _shader.bind()
             brush=group['brush']
             _shader.uniform_sampler('edgeData',group['texture'])
             _shader.uniform_sampler('extraNormals',group['normal_texture'])
             _shader.uniform_sampler('styleData',group['style_texture'])
+            for name,key in (('curveData','curve_texture'),('chainData','chain_texture'),('colorImage','color_texture'),('sizeImage','size_texture'),('coordinateData','coordinate_texture')):_shader.uniform_sampler(name,group[key])
             _shader.uniform_float('viewportInfo',(context.region.width,context.region.height,group['width'],int(view.is_perspective)))
             _batch.draw_instanced(_shader, instance_count=len(group['records']))
         entry['draws']+=1;entry['draw_ms']=(time.perf_counter()-start)*1000
@@ -354,13 +412,15 @@ def stop(scene):
     if not _states:
         if _handle is not None:bpy.types.SpaceView3D.draw_handler_remove(_handle,'WINDOW');_handle=None
         _shader=None;_batch=None
+        from . import gpu_chain
+        gpu_chain.reset()
 
 
 @persistent
 def _changed(scene, depsgraph):
     if _building:return
     entry=_states.get(scene.as_pointer())
-    if entry and any(isinstance(update.id,(bpy.types.Object,bpy.types.Mesh)) and
+    if entry and any(isinstance(update.id,(bpy.types.Object,bpy.types.Mesh,bpy.types.Image)) and
                      (update.id.original.as_pointer() in entry['source_ids'] or isinstance(update.id,bpy.types.Mesh)
                       or getattr(update.id,'type',None)=='MESH' or getattr(update.id,'instance_type',None)=='COLLECTION')
                      for update in depsgraph.updates):
@@ -394,6 +454,8 @@ def reset(*_args):
     _states.clear()
     if _handle is not None:bpy.types.SpaceView3D.draw_handler_remove(_handle,'WINDOW');_handle=None
     _shader=None;_batch=None
+    from . import gpu_chain
+    gpu_chain.reset()
 
 
 def register():

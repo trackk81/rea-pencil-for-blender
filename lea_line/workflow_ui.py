@@ -231,7 +231,8 @@ def draw_actions(layout, context, tree=None):
         entry=free_view._entries.get(context.scene.as_pointer())
         if gpu_live:
             layout.label(text='이동 중에도 선 유지 · Solid / X-Ray 끔',icon='INFO')
-            layout.label(text='기본 실선 · AA 차이 있음',icon='INFO')
+            layout.label(text='곡선 · 점선 · 맵 · 숨은 선 (GPU)',icon='INFO')
+            layout.label(text='Native와 시작점·연결부·AA 차이 있음',icon='INFO')
         else:
             layout.label(text='자유 시점 추적 중' if entry else '카메라 기준 미리보기 · Numpad 0', icon='CAMERA_DATA')
         if not gpu_live and settings.preview_compute=='GPU':
