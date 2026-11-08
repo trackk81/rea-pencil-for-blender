@@ -26,7 +26,7 @@ if _applied:
     globals().pop('update_core', None)
     exec(compile(_Path(__file__).read_bytes(), __file__, 'exec'), globals())
 else:
-    from . import backend, ui, presets, reference_controls, preview_material, updater, gpu_preview, gpu_render
+    from . import backend, ui, presets, reference_controls, preview_material, updater, gpu_preview, gpu_render, f12_render
 
     _registered = False
 
@@ -37,7 +37,7 @@ else:
             return
         completed = []
         try:
-            for module in (reference_controls, ui, presets, preview_material, backend, gpu_preview, gpu_render, updater):
+            for module in (reference_controls, ui, presets, preview_material, backend, gpu_preview, gpu_render, f12_render, updater):
                 module.register()
                 completed.append(module)
         except Exception:
@@ -55,6 +55,7 @@ else:
         from . import viewport
         from . import render_cache
         updater.unregister()
+        f12_render.unregister()
         gpu_render.unregister()
         gpu_preview.unregister()
         render_cache.clear()

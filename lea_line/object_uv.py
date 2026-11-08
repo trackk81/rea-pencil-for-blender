@@ -441,15 +441,11 @@ def _render_done(*args):_active.clear()
 class LEA_OT_prepared_render(bpy.types.Operator):
     bl_idname='lea_line.prepared_render'
     bl_label='Render Image'
-    bl_description='Prepare Object UV on the main thread, then start Blender rendering'
+    bl_description='Render the scene with REA GPU lines when enabled, otherwise prepare native rendering'
     @classmethod
-    def poll(cls,context):return context.scene is not None and not bpy.app.is_job_running('RENDER')
+    def poll(cls,context):return context.scene is not None
     def execute(self,context):
-        try:prepare_scene(context.scene,apply_styles=True)
-        except Exception as exc:
-            self.report({'ERROR'},str(exc));return {'CANCELLED'}
-        result=bpy.ops.render.render('INVOKE_DEFAULT')
-        return {'FINISHED'} if result & {'RUNNING_MODAL','FINISHED'} else {'CANCELLED'}
+        return bpy.ops.lea_line.render_f12('EXEC_DEFAULT')
     def invoke(self,context,event):return self.execute(context)
 
 

@@ -221,6 +221,7 @@ def draw_actions(layout, context, tree=None):
     render.operator('lea_line.render', text='Render', icon='RENDER_STILL')
     lines=layout.row();lines.enabled=bool(settings.tree and context.scene.camera)
     lines.operator('lea_line.render_lines',text='GPU 라인만 렌더 · 투명 배경',icon='RENDERLAYERS')
+    layout.prop(settings, 'f12_gpu_lines', text='F12 GPU 선 렌더')
     views=layout.row(align=True)
     if gpu_live or (settings.preview_compute=='GPU' and not settings.preview_enabled):
         views.label(text='GPU · 현재 시점을 자동 추적',icon='VIEW3D')

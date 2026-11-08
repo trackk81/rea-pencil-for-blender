@@ -11,7 +11,7 @@ bpy.ops.object.select_all(action='SELECT');bpy.ops.object.delete(use_global=Fals
 s=bpy.context.scene;s.render.resolution_x=256;s.render.resolution_y=192;s.render.resolution_percentage=100;s.eevee.taa_render_samples=8
 s.render.image_settings.file_format='PNG';s.render.image_settings.color_mode='RGBA';s.render.film_transparent=True
 s.view_settings.view_transform='Standard';s.render.dither_intensity=0
-bpy.ops.mesh.primitive_cube_add();cube=bpy.context.object
+bpy.ops.mesh.primitive_plane_add(size=2);cube=bpy.context.object
 mat=bpy.data.materials.new('Emission surface');mat.diffuse_color=(.1,.3,.7,1);cube.data.materials.append(mat)
 bpy.ops.object.grease_pencil_add(type='STROKE');helper=bpy.context.object;helper.modifiers.new('Generated Line Art','LINEART')
 bpy.ops.object.grease_pencil_add(type='STROKE',location=(10,0,0));drawing=bpy.context.object
@@ -51,6 +51,19 @@ im=bpy.data.images.load(s.render.filepath,check_existing=False);a=np.array(im.pi
 assert ((a[:,:,0]>a[:,:,2]+.1)&(a[:,:,3]>.1)).sum()>100
 assert (a[:,:,3]==0).sum()>100
 checks['beauty_GPU_color_alpha_and_transparent_background']=True
+# Check the actual beauty/compositor result, not just the raw line buffer.
+# A single open quad avoids coincident front/back cube edges.
+mat.use_nodes=True;mat.node_tree.nodes.clear();emit=mat.node_tree.nodes.new('ShaderNodeEmission');emit.inputs['Color'].default_value=(.1,.2,.3,1);emit.inputs['Strength'].default_value=1
+output=mat.node_tree.nodes.new('ShaderNodeOutputMaterial');mat.node_tree.links.new(emit.outputs[0],output.inputs['Surface'])
+grade.inputs['Bright'].default_value=0;s.view_settings.look='None';s.view_settings.exposure=0;s.view_settings.gamma=1
+run('numeric_color_alpha')
+im=bpy.data.images.load(s.render.filepath,check_existing=False);pixel=np.array(im.pixels[:]).reshape(im.size[1],im.size[0],4)[96,87,:3];bpy.data.images.remove(im)
+linear=np.where(pixel<=.04045,pixel/12.92,((pixel+.055)/1.055)**2.4)
+expected=np.array((.55,.1,.15))
+assert np.max(np.abs(linear-expected))<.008,(pixel,linear,expected)
+checks['composited_half_alpha_RGB_matches_analytic_linear_blend']=True
+# Preserve a non-identity authored post-process in the following checks.
+grade.inputs['Bright'].default_value=2
 checks['generated_lines_excluded_authored_GP_kept']=True
 checks['original_graph_settings_and_image_ownership_restored']=True
 s.use_nodes=False;comp.mute=True;comp.use_alpha=False;file.mute=False

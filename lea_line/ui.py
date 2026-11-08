@@ -169,6 +169,7 @@ def _preview_changed(settings, context):
 
 
 class LEALineSettings(bpy.types.PropertyGroup):
+    f12_gpu_lines: BoolProperty(name='F12 GPU Lines', description='F12로 REA GPU 선과 장면을 합성합니다. REA 그래프가 없는 장면은 기본 렌더를 사용합니다', default=True)
     fast_line_art: BoolProperty(name="Line Art Render (Experimental)", description="Alternative rendering for intersections and potential speed gains; different strokes, limited brush support; F12 stays normal", default=False)
     stroke_width_profile: EnumProperty(name="Stroke Coverage", description="Line Art final render only; choose geometric width or empirical coverage matched to the original Simple brush", items=[("PHYSICAL", "Geometric Width", "Keep geometric pixel width; existing behavior"), ("PENCIL_SIMPLE", "Pencil-like Simple", "Empirical wider coverage measured from the original Simple brush; not full brush parity")], default="PHYSICAL")
     line_art_aa: EnumProperty(name="Edge Smoothing", description="Line Art final render only; crisp edges can look stair-stepped", items=[('SCENE', 'Scene SMAA', 'Keep the scene Grease Pencil antialiasing setting'), ('CRISP', 'Crisp Edges', 'Disable SMAA filtering; sharper coverage but more jagged edges')], default='SCENE')
@@ -610,7 +611,7 @@ def _draw_output_settings(context, layout, tree, runtime=False):
     row = layout.row(align=True)
     row.operator('lea_line.apply', text='Apply', icon='FILE_REFRESH')
     row.operator('lea_line.render', text='Render', icon='RENDER_STILL')
-    layout.label(text='Use the REA Render button for GPU lines', icon='INFO')
+    layout.prop(settings, 'f12_gpu_lines')
 
 
 def _draw_runtime_panel(context, layout, tree):
@@ -1492,7 +1493,7 @@ class LEA_OT_render(bpy.types.Operator):
         context.scene.lea_line.last_render_seconds = result['seconds']
         context.scene.lea_line.last_message = f"GPU 선 합성 렌더: {result['seconds']:.3f}s"
         self.report({'INFO'}, context.scene.lea_line.last_message)
-        if not bpy.app.background:
+        if not bpy.app.background and context.preferences.view.render_display_type != 'NONE':
             bpy.ops.render.view_show('INVOKE_DEFAULT')
         return {'FINISHED'}
 
@@ -1513,7 +1514,8 @@ class LEA_OT_render_lines(bpy.types.Operator):
         context.scene.lea_line.last_message=f"독립 GPU 라인 렌더: {result['seconds']:.3f}s · 투명 배경 · 저장 시 PNG RGBA"
         if result['warnings']:self.report({'WARNING'},'; '.join(result['warnings']))
         self.report({'INFO'},context.scene.lea_line.last_message)
-        if not bpy.app.background:bpy.ops.render.view_show('INVOKE_DEFAULT')
+        if not bpy.app.background and context.preferences.view.render_display_type != 'NONE':
+            bpy.ops.render.view_show('INVOKE_DEFAULT')
         return {'FINISHED'}
 
 
