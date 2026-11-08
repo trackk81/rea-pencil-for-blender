@@ -1535,16 +1535,17 @@ class LEA_OT_render(bpy.types.Operator):
 class LEA_OT_render_lines(bpy.types.Operator):
     bl_idname = 'lea_line.render_lines'
     bl_label = '라인만 렌더'
-    bl_description = '현재 뷰 레이어의 Freestyle 선만 투명 배경으로 출력합니다. 저장 시 PNG RGBA를 선택하세요'
+    bl_description = '독립 GPU 엔진으로 메시 선만 투명 배경에 출력합니다. 미지원 브러시는 오류로 알리며 다른 렌더로 전환하지 않습니다'
 
     def execute(self,context):
-        from . import line_output
+        from . import gpu_render
         try:
-            result=line_output.render(context.scene,context.view_layer)
+            result=gpu_render.render_lines(context.scene)
         except Exception as exc:
             self.report({'ERROR'},str(exc));return {'CANCELLED'}
+        if result['status']=='cancelled':return {'CANCELLED'}
         context.scene.lea_line.last_render_seconds=result['seconds']
-        context.scene.lea_line.last_message=f"라인만 렌더: {result['seconds']:.3f}s · 투명 배경 · 저장 시 PNG RGBA"
+        context.scene.lea_line.last_message=f"독립 GPU 라인 렌더: {result['seconds']:.3f}s · 투명 배경 · 저장 시 PNG RGBA"
         if result['warnings']:self.report({'WARNING'},'; '.join(result['warnings']))
         self.report({'INFO'},context.scene.lea_line.last_message)
         if not bpy.app.background:bpy.ops.render.view_show('INVOKE_DEFAULT')

@@ -7,7 +7,7 @@ def snapshot(depsgraph):
     for instance in depsgraph.object_instances:
         obj=instance.object
         if obj.type!='MESH' or not instance.show_self:continue
-        if not instance.is_instance and not obj.original.visible_get(view_layer=depsgraph.view_layer):continue
+        if depsgraph.mode != 'RENDER' and not instance.is_instance and not obj.original.visible_get(view_layer=depsgraph.view_layer):continue
         mesh=obj.to_mesh()
         try:
             mesh.calc_loop_triangles();v=np.empty((len(mesh.vertices),3),np.float32);mesh.vertices.foreach_get('co',v.ravel())

@@ -42,8 +42,18 @@ def _jobs(scene):
     for node, common in backend._specifications(scene.lea_line.tree):
         if material_scope.active(node) or node.use_material_functions:
             raise ValueError('GPU: 재질별 얼굴 선택·Line Functions는 Native를 사용하세요')
-        collection = backend.source_collection(scene, node)
-        targets = set(collection.all_objects) if collection else set(scene.objects)
+        # Resolve identities without creating/linking helper collections inside
+        # a render callback. Render depsgraph objects are evaluated copies.
+        available = {o.original for o in scene.objects}
+        listed = getattr(node, 'objects', ())
+        if len(listed):
+            targets = {item.object.original for item in listed if item.object} & available
+        elif getattr(node, 'target_mode', 'ALL') == 'ALL' or node.source_collection:
+            targets = available
+        else:
+            targets = set()
+        if node.source_collection:
+            targets.intersection_update(o.original for o in node.source_collection.all_objects)
         for visibility,enabled in (('VISIBLE',node.visible),('HIDDEN',node.hidden)):
             if not enabled:continue
             if any(routing.feature_enabled(node,k,visibility) for k in ('intersection','ridge_valley','suggestive_contour')):
@@ -134,6 +144,72 @@ def _channel(brush, kind):
             brush.far_thickness if kind == 'SIZE' else brush.far_alpha, float(enabled))
 
 
+def snapshot(scene, dg):
+    """Copy evaluated geometry without installing viewport handlers or timers.
+
+    A render engine passes its RENDER depsgraph; viewport sync passes VIEWPORT.
+    All Blender data is copied synchronously in the calling Blender callback.
+    """
+    from . import backend, gpu_styles, gpu_depth
+    start = time.perf_counter()
+    jobs = _jobs(scene)
+    groups = []
+    source_ids = set()
+    # The viewport depth buffer can reject the expanded stroke quad against
+    # its own sloping surface. Classify the centerline against our unjittered
+    # mesh depth in every shading mode, then draw the whole stroke as overlay.
+    needs_depth=True
+    for node, brush, targets in jobs:
+        pieces = []; extra_pieces=[];extra_offset=0
+        map_pieces=[];chain_vertices=[];chain_ends=[];vertex_offset=0
+        style=gpu_styles.snapshot(brush,backend.width_scale(scene,node),getattr(node,'_gpu_hidden',False),needs_depth)
+        for instance in dg.object_instances:
+            obj = instance.object
+            parent=instance.parent.original if instance.is_instance and instance.parent else None
+            if obj.type != 'MESH' or (obj.original not in targets and parent not in targets) or not instance.show_self:
+                continue
+            if dg.mode != 'RENDER' and not instance.is_instance and not obj.original.visible_get(view_layer=dg.view_layer):
+                continue
+            mesh = obj.to_mesh()
+            try:
+                payload={};records,extra=_records(mesh, instance.matrix_world, node,payload)
+                if len(records):
+                    mapped=gpu_styles.mesh_maps(mesh,payload,style['maps'])
+                    if mapped is not None:map_pieces.append(mapped)
+                    if style['needs_chain']:
+                        used,inverse=np.unique(payload['endpoints'],return_inverse=True)
+                        chain_vertices.append(payload['world_vertices'][used]);chain_ends.append(inverse.reshape(-1,2)+vertex_offset);vertex_offset+=len(used)
+                records[records[:,3,3]>2,2,3]+=extra_offset
+                pieces.append(records);extra_pieces.append(extra);extra_offset+=len(extra)
+                source_ids.add(obj.original.as_pointer())
+                if parent:source_ids.add(parent.as_pointer())
+                if obj.original.data:source_ids.add(obj.original.data.as_pointer())
+            finally:obj.to_mesh_clear()
+        records = np.concatenate(pieces) if pieces else np.empty((0,4,4), np.float32)
+        if len(records) > 2_000_000:
+            raise ValueError('GPU 시험 경로의 모서리 메모리 한도를 넘었습니다')
+        extra=np.concatenate(extra_pieces) if extra_pieces else np.empty((0,4),np.float32)
+        map_coordinates=np.concatenate(map_pieces) if map_pieces else np.zeros((1,4),np.float32)
+        if 'size' in style['maps'] and style['maps']['size'].source_type=='OBJECTCOLOR' and map_pieces:
+            maximum=float(np.max(map_coordinates[:,4:8,:3]@np.array((.2126,.7152,.0722))))
+            style['params'][3,2]*=max(1.,1-brush.size_map_amount+brush.size_map_amount*maximum)
+        if style['params'][3,2]*brush.thickness*backend.width_scale(scene,node)>512:raise ValueError('GPU: 효과 적용 굵기가 512px를 넘으면 Native를 사용하세요')
+        groups.append({'records': records, 'extra_normals':extra, 'texture': None, 'brush': brush,
+                       'style':style,'map_coordinates':map_coordinates,
+                       'chain_vertices':np.concatenate(chain_vertices) if chain_vertices else np.zeros((0,3),np.float32),
+                       'chain_endpoints':np.concatenate(chain_ends) if chain_ends else np.zeros((0,2),np.int32),
+                       'width': brush.thickness*backend.width_scale(scene, node),
+                       'size_reduction': _channel(brush, 'SIZE'), 'alpha_reduction': _channel(brush, 'ALPHA')})
+    for group in groups:
+        for obj in group['style']['references']:source_ids.add(obj.as_pointer())
+        for n in group['style']['maps'].values():
+            if getattr(n,'image',None):source_ids.add(n.image.as_pointer())
+    depth_data=gpu_depth.snapshot(dg) if needs_depth else None
+    return {'groups': groups, 'source_ids': source_ids,'depth':depth_data,
+        'edges': sum(len(g['records']) for g in groups), 'build_ms': (time.perf_counter()-start)*1000,
+        'draw_ms': 0., 'draws': 0, 'uploads': 0, 'dirty': False, 'error': ''}
+
+
 def sync(scene):
     global _handle, _building
     if bpy.app.background:
@@ -142,67 +218,12 @@ def sync(scene):
     from . import free_view
     followed=free_view._entries.get(scene.as_pointer())
     if followed:free_view._restore_navigation(followed)
-    jobs = _jobs(scene)
-    start = time.perf_counter(); _building = True
+    _building = True
     try:
         window=next((w for w in bpy.context.window_manager.windows if w.scene==scene),None)
         if window is None:raise ValueError('GPU 미리보기 장면을 Blender 창에서 여세요')
         with bpy.context.temp_override(window=window):dg = bpy.context.evaluated_depsgraph_get()
-        groups = []
-        source_ids = set()
-        # The viewport depth buffer can reject the expanded stroke quad against
-        # its own sloping surface. Classify the centerline against our unjittered
-        # mesh depth in every shading mode, then draw the whole stroke as overlay.
-        needs_depth=True
-        for node, brush, targets in jobs:
-            pieces = []; extra_pieces=[];extra_offset=0
-            map_pieces=[];chain_vertices=[];chain_ends=[];vertex_offset=0
-            style=gpu_styles.snapshot(brush,backend.width_scale(scene,node),getattr(node,'_gpu_hidden',False),needs_depth)
-            for instance in dg.object_instances:
-                obj = instance.object
-                parent=instance.parent.original if instance.is_instance and instance.parent else None
-                if obj.type != 'MESH' or (obj.original not in targets and parent not in targets) or not instance.show_self:
-                    continue
-                if not instance.is_instance and not obj.original.visible_get(view_layer=dg.view_layer):
-                    continue
-                mesh = obj.to_mesh()
-                try:
-                    payload={};records,extra=_records(mesh, instance.matrix_world, node,payload)
-                    if len(records):
-                        mapped=gpu_styles.mesh_maps(mesh,payload,style['maps'])
-                        if mapped is not None:map_pieces.append(mapped)
-                        if style['needs_chain']:
-                            used,inverse=np.unique(payload['endpoints'],return_inverse=True)
-                            chain_vertices.append(payload['world_vertices'][used]);chain_ends.append(inverse.reshape(-1,2)+vertex_offset);vertex_offset+=len(used)
-                    records[records[:,3,3]>2,2,3]+=extra_offset
-                    pieces.append(records);extra_pieces.append(extra);extra_offset+=len(extra)
-                    source_ids.add(obj.original.as_pointer())
-                    if parent:source_ids.add(parent.as_pointer())
-                    if obj.original.data:source_ids.add(obj.original.data.as_pointer())
-                finally:obj.to_mesh_clear()
-            records = np.concatenate(pieces) if pieces else np.empty((0,4,4), np.float32)
-            if len(records) > 2_000_000:
-                raise ValueError('GPU 시험 경로의 모서리 메모리 한도를 넘었습니다')
-            extra=np.concatenate(extra_pieces) if extra_pieces else np.empty((0,4),np.float32)
-            map_coordinates=np.concatenate(map_pieces) if map_pieces else np.zeros((1,4),np.float32)
-            if 'size' in style['maps'] and style['maps']['size'].source_type=='OBJECTCOLOR' and map_pieces:
-                maximum=float(np.max(map_coordinates[:,4:8,:3]@np.array((.2126,.7152,.0722))))
-                style['params'][3,2]*=max(1.,1-brush.size_map_amount+brush.size_map_amount*maximum)
-            if style['params'][3,2]*brush.thickness*backend.width_scale(scene,node)>512:raise ValueError('GPU: 효과 적용 굵기가 512px를 넘으면 Native를 사용하세요')
-            groups.append({'records': records, 'extra_normals':extra, 'texture': None, 'brush': brush,
-                           'style':style,'map_coordinates':map_coordinates,
-                           'chain_vertices':np.concatenate(chain_vertices) if chain_vertices else np.zeros((0,3),np.float32),
-                           'chain_endpoints':np.concatenate(chain_ends) if chain_ends else np.zeros((0,2),np.int32),
-                           'width': brush.thickness*backend.width_scale(scene, node),
-                           'size_reduction': _channel(brush, 'SIZE'), 'alpha_reduction': _channel(brush, 'ALPHA')})
-        for group in groups:
-            for obj in group['style']['references']:source_ids.add(obj.as_pointer())
-            for n in group['style']['maps'].values():
-                if getattr(n,'image',None):source_ids.add(n.image.as_pointer())
-        depth_data=gpu_depth.snapshot(dg) if needs_depth else None
-        _states[scene.as_pointer()] = {'groups': groups, 'source_ids': source_ids,'depth':depth_data,
-            'edges': sum(len(g['records']) for g in groups), 'build_ms': (time.perf_counter()-start)*1000,
-            'draw_ms': 0., 'draws': 0, 'uploads': 0, 'dirty': False, 'error': ''}
+        _states[scene.as_pointer()] = snapshot(scene, dg)
         if _handle is None:_handle = bpy.types.SpaceView3D.draw_handler_add(_draw, (), 'WINDOW', 'POST_VIEW')
         if not bpy.app.timers.is_registered(_watch):bpy.app.timers.register(_watch, first_interval=.2)
         from . import curves,preview_runtime
