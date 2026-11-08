@@ -53,7 +53,10 @@ def select_release(releases, current):
                 continue
             if not 0 < asset.get('size', 0) <= MAX_ZIP:
                 continue
-            choices.append({'version': number, 'url': url, 'sha256': digest[7:], 'size': asset['size'], 'name': name,
+            api_url = asset.get('url', '')
+            if not re.fullmatch(re.escape(API) + r'/releases/assets/\d+', api_url):
+                api_url = None
+            choices.append({'version': number, 'url': url, 'api_url': api_url, 'sha256': digest[7:], 'size': asset['size'], 'name': name,
                             'release_url': 'https://github.com/' + REPOSITORY + '/releases/tag/' + release['tag_name']})
     return max(choices, key=lambda item: item['version']) if choices else None
 
@@ -92,7 +95,10 @@ def download(release, directory, blender_version):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / (uuid.uuid4().hex + '.zip')
-    request = urllib.request.Request(release['url'], headers={'User-Agent': 'rea-pencil-for-blender-updater'})
+    # GitHub's public asset API avoids browser-download gateway failures.
+    url = release.get('api_url')
+    url = url + '?download=1' if url else release['url']
+    request = urllib.request.Request(url, headers={'User-Agent': 'rea-pencil-for-blender-updater', 'Accept': 'application/octet-stream'})
     try:
         count = 0
         digest = hashlib.sha256()
