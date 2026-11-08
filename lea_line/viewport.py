@@ -141,6 +141,13 @@ def _object(scene, owner, key):
     if obj.hide_get(view_layer=scene.view_layers[0]):
         obj.hide_set(False, view_layer=scene.view_layers[0])
         _last_sync_stats["visibility_writes"] += 1
+    # Line Art defaults to a 0.05 world-unit camera-depth displacement. That
+    # becomes a lateral offset when the user views the strokes from another
+    # angle, especially close to a mesh. Keep generated points on the surface;
+    # authored Brush Detail pixel offsets remain independent.
+    modifier = next((m for m in obj.modifiers if m.type == 'LINEART'), None)
+    if modifier is not None:
+        _set(modifier, 'stroke_depth_offset', 0.0)
     return obj
 
 

@@ -30,7 +30,8 @@ _paused_geometry = set()
 LINE_PROPERTIES = ('target_layer', 'target_material', 'use_contour', 'use_crease',
     'crease_threshold', 'use_crease_on_smooth', 'use_crease_on_sharp', 'use_material',
     'use_edge_mark', 'use_intersection', 'use_loose', 'use_shadow', 'use_light_contour',
-    'use_multiple_levels', 'level_start', 'level_end', 'opacity', 'thickness', 'use_cache')
+    'use_multiple_levels', 'level_start', 'level_end', 'opacity', 'thickness', 'use_cache',
+    'stroke_depth_offset')
 CAMERA_PROPERTIES = ('type', 'lens', 'ortho_scale', 'sensor_fit', 'sensor_width',
     'sensor_height', 'shift_x', 'shift_y', 'clip_start', 'clip_end')
 RENDER_PROPERTIES = ('resolution_x', 'resolution_y', 'resolution_percentage', 'pixel_aspect_x', 'pixel_aspect_y')
