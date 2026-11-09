@@ -565,5 +565,46 @@ finally:
     s.render.use_border = s.render.use_crop_to_border = False
 checks['render_region_preserves_wave_phase_and_aa_at_the_border']=True
 
+# A rounded silhouette next to a floor must not be cut by its own inward taps.
+for obj in s.objects:
+    if obj.type=='MESH':obj.hide_render=True
+s.render.resolution_x,s.render.resolution_y=960,640
+s.camera.location=(0,-4.1,2.5)
+s.camera.rotation_euler=(Vector((0,.16,.37))-s.camera.location).to_track_quat('-Z','Y').to_euler()
+s.camera.data.type='PERSP'
+s.camera.data.lens=46
+def rounded_box(location,dimensions,radius,rotation):
+    bpy.ops.mesh.primitive_cube_add(size=1,location=location)
+    obj=bpy.context.object
+    obj.dimensions=dimensions
+    bpy.ops.object.transform_apply(location=False,rotation=False,scale=True)
+    bevel=obj.modifiers.new('Silhouette contact','BEVEL')
+    bevel.width=radius
+    bevel.segments=5
+    obj.rotation_euler.z=rotation
+    return obj
+
+rounded=rounded_box((.96,1.23,.43),(.62,.66,.86),.12,-.18)
+bpy.ops.mesh.primitive_plane_add(size=200)
+floor=bpy.context.object
+with ui.suspend_sync():
+    n.visible,n.hidden=True,False
+    n.outline,n.edge_mark=True,False
+    n.objects.clear()
+    n.objects.add().object=rounded
+    detail.distortion_enabled=False
+    output.antialiasing=output.over_sampling=1
+    brush.thickness=5
+floor.hide_render=True
+reference=capture()[315:375,604:710,3]
+floor.hide_render=False
+contact=capture()[315:375,604:710,3]
+assert np.count_nonzero(reference>.5)>200
+assert not np.any((reference>.5)&(contact<.1))
+rounded_box((.98,-.19,.28),(.47,.43,.56),.09,-.28)
+occluded=capture()[315:375,604:710,3]
+assert np.count_nonzero((contact>.5)&(occluded<.1))>25
+checks['rounded_outline_stays_continuous_at_floor_contact_and_keeps_external_occlusion']=True
+
 report={'status':'ok','checks':checks,'distance_metrics':rows,'occlusion':{'visible_left':left,'visible_right':right,'hidden_left':hleft,'hidden_right':hright},'scope':'Orthographic, opaque mesh occluder, 800x400, round solid brush. Does not establish transparent-material or Pencil+ AA parity.'}
 (OUT/'report.json').write_text(json.dumps(report,indent=2),encoding='utf-8');print('GPU_STYLE_METRICS_OK',json.dumps(report),flush=True)

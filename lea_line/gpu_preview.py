@@ -692,6 +692,29 @@ vec2 segmentDepths() {
     vec4 a=viewProjection*vec4(worldA,1), b=viewProjection*vec4(worldB,1);
     return vec2(a.z/a.w,b.z/b.w)*.5+.5;
 }
+float outlineDepthTap(ivec2 pixel,vec2 center,float depth) {
+    float observed=texelFetch(sceneDepth,pixel,0).r;
+    float owner=texelFetch(objectDepth,pixel,0).r;
+    // A silhouette's inward taps can hit its own bevel before the edge.
+    // Keep the depth of a different mesh when it is in front of that skin.
+    bool inward=dot(vec2(pixel)+.5-center,objectOutside)<0.0;
+    return inward && owner<1.0 && abs(observed-owner)<=1e-7 ? depth : observed;
+}
+float outlineCenterDepth(vec2 center,float depth,float sampledDepth) {
+    if (dot(objectOutside,objectOutside)<.5) return sampledDepth;
+    ivec2 outside=ivec2(floor(center+objectOutside*1.5));
+    ivec2 base=ivec2(floor(center-.5));
+    ivec2 size=textureSize(sceneDepth,0);
+    if (any(lessThan(min(base,outside),ivec2(0))) ||
+        any(greaterThanEqual(max(base+1,outside),size)) ||
+        texelFetch(objectDepth,outside,0).r<1.0) return sampledDepth;
+    vec2 f=fract(center-.5);
+    float a=mix(outlineDepthTap(base,center,depth),
+                outlineDepthTap(base+ivec2(1,0),center,depth),f.x);
+    float b=mix(outlineDepthTap(base+ivec2(0,1),center,depth),
+                outlineDepthTap(base+ivec2(1,1),center,depth),f.x);
+    return mix(a,b,f.y);
+}
 bool spanMeetsMinimum(vec4 points,vec2 depths,float position,bool hidden) {
     float minimum=styleValue(7).z;
     vec4 span=readStyleTex(visibilityData,int(edgeIndex));
@@ -858,9 +881,11 @@ void main() {
         vec2 center=mix(points.xy,points.zw,t);
         vec4 clip=viewProjection*vec4(mix(worldA,worldB,u),1);float depth=clip.z/clip.w*.5+.5;
         float scene=markedCenterDepth(center,points.zw-points.xy,depth,normalDepthPlanes);
-        bool hidden=depth>scene+.000002;
         vec2 objectOptions=styleValue(6).zw;
         float objectMode=objectOptions.x;
+        if (objectMode==-1.0 && objectOptions.y<.5 && depth>scene+.000002)
+            scene=outlineCenterDepth(center,depth,scene);
+        bool hidden=depth>scene+.000002;
         if (rearCrease>.5) {
             // The shared side face collapses in projection. The inward
             // sample reaches the nearer skin without blending with the
