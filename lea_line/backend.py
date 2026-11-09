@@ -80,7 +80,7 @@ def ensure_default_tree(scene, create_detail=False):
     return tree
 
 
-def _specifications(tree):
+def _specifications(tree, *, with_output=False):
     """Only output-connected sets render; disconnected drafts remain drafts."""
     outputs = sorted((n for n in tree.nodes if n.bl_idname == "LEAOutputNode" and n.enabled),
                      key=lambda n: n.render_priority)
@@ -118,7 +118,9 @@ def _specifications(tree):
                             raise ValueError('Distance End must be greater than Distance Start')
                 from . import object_uv
                 object_uv.validate_visibility(node,brush)
-                group.append((LineSetContext(node, output) if output.width_mode != 'INHERIT' or output.random_seed else node, brush))
+                if with_output or output.width_mode != 'INHERIT' or output.random_seed:
+                    node = LineSetContext(node, output)
+                group.append((node, brush))
         result.extend(sorted(group, key=lambda pair: getattr(pair[0], 'render_priority', 0)))
     return result
 
@@ -223,6 +225,12 @@ def sync_scene(scene, tree=None):
             for index, (node, brush) in enumerate(specifications):
                 if routing.any_enabled(node, 'intersection'):
                     warnings.append(f"{node.name}: intersection lines are not supported by this backend")
+                if routing.any_enabled(node, 'wireframe'):
+                    warnings.append(f"{node.name}: Wireframe uses GPU preview or GPU render.")
+                if routing.any_enabled(node, 'smoothing_boundary'):
+                    warnings.append(f"{node.name}: Smoothing Boundary uses GPU preview or GPU render.")
+                if routing.any_enabled(node, 'object_edge'):
+                    warnings.append(f"{node.name}: Object contours use GPU preview or GPU render.")
                 for visibility, enabled in (("VISIBLE", node.visible), ("HIDDEN", node.hidden)):
                     if not enabled:
                         continue

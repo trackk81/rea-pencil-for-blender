@@ -8,6 +8,8 @@ FEATURES = (
     ('crease', 'crease'), ('ridge_valley', 'ridge_valley'),
     ('suggestive_contour', 'suggestive_contour'),
 )
+GPU_ONLY_EDGE_FEATURES = ('wireframe', 'smoothing_boundary', 'object_edge')
+GPU_EDGE_BRUSH_PRIORITY = ('outline', 'object_edge', 'smoothing_boundary', 'material_boundary', 'edge_mark', 'crease', 'wireframe')
 
 
 class ResolvedBrush:
@@ -128,8 +130,8 @@ def jobs(node, common_brush, visibility):
     return result
 
 
-def live_brush(node, common_brush, visibility):
-    """Resolve one unambiguous Line Art category without splitting overlaps.
+def live_brush(node, common_brush, visibility, *, gpu=False):
+    """Resolve one unambiguous edge category without splitting overlaps.
 
     Contour/border grouping and multi-category precedence need separate geometry
     support. Keep the existing common-brush fallback for those cases.
@@ -139,11 +141,33 @@ def live_brush(node, common_brush, visibility):
     apply=line_brush
     base = apply(node, base, visibility)
     active = [feature for feature, _ in FEATURES if feature_enabled(node, feature, visibility)]
+    supported = {'edge_mark', 'crease', 'material_boundary'}
+    if gpu:
+        active.extend(feature for feature in GPU_ONLY_EDGE_FEATURES if feature_enabled(node, feature, visibility))
+        supported.update(GPU_EDGE_BRUSH_PRIORITY)
     if feature_enabled(node, 'intersection', visibility):
         active.append('intersection')
     prefix = 'Hidden ' if visibility == 'HIDDEN' else ''
     overrides = {feature: connected_brush(node, prefix + feature + ' Brush')
                  for feature in active}
-    if len(active) == 1 and active[0] in {'edge_mark', 'crease', 'material_boundary'}:
+    if len(active) == 1 and active[0] in supported:
         return apply(node, overrides[active[0]], visibility) if overrides[active[0]] else base, False
     return base, any(value is not None for value in overrides.values())
+
+
+def gpu_edge_brushes(node, base, visibility, features, *, allow_border=False):
+    """Split categories where the original overlap order is known."""
+    active = {feature for feature in features if feature_enabled(node, feature, visibility)}
+    priority = GPU_EDGE_BRUSH_PRIORITY + (('border',) if allow_border else ())
+    if not active.issubset(priority):
+        return []
+    prefix = 'Hidden ' if visibility == 'HIDDEN' else ''
+    result = []
+    previous = []
+    for feature in priority:
+        if feature in active:
+            specific = connected_brush(node, prefix + feature + ' Brush')
+            brush = line_brush(node, specific, visibility) if specific is not None else base
+            result.append((feature, brush, tuple(previous)))
+            previous.append(feature)
+    return result

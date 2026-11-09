@@ -2,10 +2,11 @@
 
 Mesh adjacency is prepared once on Blender's main thread. Per-view selection,
 screen lengths, loop anchors and prefix lengths stay on the GPU. Branches split
-chains; visibility gaps do not reset their phase. This is not Native chaining.
+chains. The optional depth pass also measures continuous visibility runs.
 """
 import math
 import numpy as np
+from .gpu_depth import CENTER_DEPTH, MARKED_DEPTH, SPAN_LENGTH
 
 _shader=None
 
@@ -33,25 +34,61 @@ def topology(vertices,endpoints):
     return vertex_data,edge_data,adjacency
 
 
-SOURCE=r'''
+EDGE_SELECTION = r'''
+float objectFacing(float facing, float winding, float mode) {
+    // An exactly edge-on face cannot supply the interior side of a contour.
+    return mode!=0.0 && abs(winding)==1.0 && abs(facing)<1e-7 ? -1e-7 : facing;
+}
+float markNormalSide(vec4 firstFace,vec4 secondFace,vec3 toEye) {
+    // Compare the two faces in the same view as edge selection. A small
+    // tolerance keeps coplanar faces on their authored winding side.
+    float difference=dot(secondFace.xyz-firstFace.xyz,toEye);
+    return -(difference>1e-6*length(toEye)?secondFace.w:firstFace.w);
+}
+
+// silhouetteMode: +1 adds an Outline edge, -1 gives Outline precedence
+// over this fallback category, and 0 uses only the static selection.
+bool edgeSelected(float fixedEdge,float silhouetteMode,float normalStart,float normalCount,
+                  vec3 toEye,float f0,float f1) {
+    if (silhouetteMode==0.0 || (fixedEdge>.5 && silhouetteMode>0.0))
+        return fixedEdge>.5;
+    bool outline=(f0>=0.0)!=(f1>=0.0);
+    if (normalCount>2.0) {
+        bool front=false,back=false;
+        int width=textureSize(extraNormals,0).x;
+        for (int i=0;i<int(normalCount);i++) {
+            int index=int(normalStart)+i;
+            float facing=dot(texelFetch(extraNormals,ivec2(index%width,index/width),0).xyz,toEye);
+            front=front || facing>=0.0; back=back || facing<0.0;
+        }
+        outline=front && back;
+    }
+    return silhouetteMode>0.0 ? outline : fixedEdge>.5 && !outline;
+}
+'''
+
+
+SOURCE=EDGE_SELECTION+CENTER_DEPTH+MARKED_DEPTH+SPAN_LENGTH+r'''
 vec4 readValue(sampler2D tex,int index){int w=textureSize(tex,0).x;return texelFetch(tex,ivec2(index%w,index/w),0);}
 vec4 edge(int e,int slot){return readValue(edgeData,e*4+slot);}
 bool selected(int e){
  vec4 a=edge(e,0),b=edge(e,1);
- if(a.w>.5)return true;
- if(b.w<.5)return false;
+ if(b.w==0.0 || (a.w>.5 && b.w>0.0))return a.w>.5;
  vec3 eye=viewportInfo.w>.5?eyeInfo.xyz-a.xyz:directionInfo.xyz;
- bool front=dot(edge(e,2).xyz,eye)>=0.0,back=dot(edge(e,3).xyz,eye)<0.0;
- int count=int(edge(e,3).w);
- if(count>2){front=false;back=false;int start=int(edge(e,2).w);
-  for(int i=0;i<count;i++){float d=dot(readValue(extraNormals,start+i).xyz,eye);front=front||d>=0.0;back=back||d<0.0;}
- }else{return front==back;}
- return front&&back;
+ vec4 n0=edge(e,2),n1=edge(e,3);
+ float mode=readValue(styleData,6).z;
+ float f0=objectFacing(dot(n0.xyz,eye),n1.w,mode);
+ float f1=objectFacing(dot(n1.xyz,eye),n1.w,mode);
+ return edgeSelected(a.w,b.w,n0.w,n1.w,eye,f0,f1);
+}
+bool projectEdge(int e,out vec4 p,out vec4 q){
+ p=viewProjection*vec4(edge(e,0).xyz,1);q=viewProjection*vec4(edge(e,1).xyz,1);
+ float a=p.z+p.w,b=q.z+q.w;if(a<=0.0&&b<=0.0)return false;
+ if(a<=0.0)p=mix(p,q,a/(a-b));else if(b<=0.0)q=mix(q,p,b/(b-a));
+ return true;
 }
 float edgeLength(int e){
- vec4 p=viewProjection*vec4(edge(e,0).xyz,1),q=viewProjection*vec4(edge(e,1).xyz,1);
- float a=p.z+p.w,b=q.z+q.w;if(a<=0.0&&b<=0.0)return 0.0;
- if(a<=0.0)p=mix(p,q,a/(a-b));else if(b<=0.0)q=mix(q,p,b/(b-a));
+ vec4 p,q;if(!projectEdge(e,p,q))return 0.0;
  return length((p.xy/p.w-q.xy/q.w)*viewportInfo.xy*.5);
 }
 vec4 initial(int halfEdge,bool cut,float anchor){
@@ -79,9 +116,72 @@ vec4 initial(int halfEdge,bool cut,float anchor){
  }
  return vec4(float(next),edgeLength(e),float(far),cut?float(start):float(min(start,far)));
 }
+vec4 visibilityHead(int halfEdge,float minimum,bool marked,bool wave){
+ vec4 link=initial(halfEdge,false,0.0);
+ if(link.z<0.0)return vec4(-1,0,0,-1);
+ vec4 p,q;projectEdge(halfEdge/2,p,q);
+ if(halfEdge%2!=0){vec4 swap=p;p=q;q=swap;}
+ vec2 origin=viewportInfo.xy*.5-vec2(counts.zw);
+ vec4 points=vec4(p.xy/p.w,q.xy/q.w)*viewportInfo.xyxy*.5+origin.xyxy;
+ vec2 depths=vec2(p.z/p.w,q.z/q.w)*.5+.5;
+ vec4 planes=vec4(0);
+ if(marked){
+  int e=halfEdge/2;
+  float traversal=halfEdge%2==0?1.0:-1.0;
+  vec4 first=edge(e,2),second=edge(e,3);
+  first.w*=traversal;second.w*=traversal;
+  planes=markedDepthPlanes(viewProjection,viewportInfo.xy,p,q,(edge(e,1).xyz-edge(e,0).xyz)*traversal,first,second);
+ }
+ float head=spanLength(points,depths,link.y,0.0,1.0,minimum,readValue(styleData,5).x>1.5,planes,wave);
+ return vec4(head>=link.y?link.x:-1.0,head,head,link.x);
+}
+vec4 visibilityResult(int edgeId){
+ vec4 forward=readValue(metaInput,edgeId*2),reverse=readValue(metaInput,edgeId*2+1);
+ // Adjacent lengths can only be reached from the matching end of this edge.
+ float before=reverse.w>=0.0?readValue(metaInput,int(reverse.w)).y:0.0;
+ float after=forward.w>=0.0?readValue(metaInput,int(forward.w)).y:0.0;
+ return vec4(before,after,forward.z,reverse.z);
+}
+float preferredTie(float first,float second){
+ return abs(second)>abs(first)?second:first;
+}
+vec4 directionHead(int halfEdge){
+ vec4 head=visibilityHead(halfEdge,1e20,true,false);
+ int e=halfEdge/2;
+ vec3 toEye=viewportInfo.w>.5?eyeInfo.xyz-edge(e,0).xyz:directionInfo.xyz;
+ float side=markNormalSide(edge(e,2),edge(e,3),toEye)*(halfEdge%2==0?1.0:-1.0);
+ vec2 ends=readValue(topologyData,e).xy;
+ // Quantize subpixel noise before summing so equal lengths remain ties.
+ return vec4(head.x,side*round(head.y*1024.0),head.y>0.0?side*float(e+1):0.0,min(ends.x,ends.y));
+}
+vec4 cutDirectionLoop(int id,vec4 ranked){
+ if(ranked.x<0.0){ranked.w=-1.0;return ranked;}
+ vec4 head=readValue(directionHeads,id);
+ vec2 ends=readValue(topologyData,id/2).xy;
+ float far=id%2==0?ends.y:ends.x;
+ if(far==ranked.w)head.x=-1.0;
+ head.w=ranked.w;
+ return head;
+}
+float directionVote(vec2 forward,vec2 reverse){
+ float vote=forward.x-reverse.x;
+ return sign(vote!=0.0?vote:preferredTie(forward.y,-reverse.y));
+}
+vec4 directionResult(int e){
+ vec4 forward=readValue(metaInput,e*2),reverse=readValue(metaInput,e*2+1);
+ ivec2 links=ivec2(readValue(jointData,e).xy);
+ vec2 ends=readValue(topologyData,e).xy;
+ // Each walk in a closed loop stops at the same seam. Do not add a
+ // second lap when the starting endpoint already lies on that seam.
+ vec2 atStart=links.x>=0 && ends.x!=forward.w?readValue(metaInput,links.x).yz:vec2(0);
+ vec2 atEnd=links.y>=0 && ends.y!=reverse.w?readValue(metaInput,links.y).yz:vec2(0);
+ float first=abs(readValue(directionHeads,e*2).y)/1024.0;
+ float last=abs(readValue(directionHeads,e*2+1).y)/1024.0;
+ return vec4(directionVote(forward.yz,atStart),directionVote(atEnd,reverse.yz),first,last);
+}
 void main(){
  int id=int(gl_GlobalInvocationID.x),mode=counts.y;
- int limit=mode==5?counts.x:counts.x*2;if(id>=limit)return;
+ int limit=(mode==5||mode==8||mode==9||mode==12)?counts.x:counts.x*2;if(id>=limit)return;
  vec4 value;
  if(mode==1)value=initial(id,false,0.0);
  else if(mode==2||mode==4){
@@ -90,19 +190,48 @@ void main(){
  }else if(mode==3){
   vec4 prior=readValue(metaInput,id);
   value=prior.x<0.0?prior:initial(id,true,prior.w);
+ }else if(mode==9){
+  // Keep the original selected links before list ranking changes them.
+  value=vec4(readValue(metaInput,id*2+1).x,readValue(metaInput,id*2).x,0,0);
+ }else if(mode==10)value=directionHead(id);
+ else if(mode==11){
+  value=readValue(metaInput,id);
+  if(value.x>=0.0){
+   vec4 tail=readValue(metaInput,int(value.x));
+   value=vec4(tail.x,value.y+tail.y,preferredTie(value.z,tail.z),min(value.w,tail.w));
+  }
+ }else if(mode==12)value=directionResult(id);
+ else if(mode==13)value=cutDirectionLoop(id,readValue(metaInput,id));
+ else if(mode>=6){
+  bool wave=readValue(styleData,18).x!=0.0;
+  float minimum=wave?1e20:readValue(styleData,7).z;
+  if(mode==6)value=visibilityHead(id,minimum,wave,wave);
+  else if(mode==8)value=visibilityResult(id);
+  else {
+   value=readValue(metaInput,id);
+   if(value.x>=0.0 && value.y<minimum){
+    vec4 tail=readValue(metaInput,int(value.x));
+    value.xy=vec2(tail.x,min(value.y+tail.y,minimum));
+   }
+  }
  }else{
   vec4 forward=readValue(metaInput,id*2),reverse=readValue(metaInput,id*2+1);
   float len=edgeLength(id),total=forward.y+reverse.y-len;
   bool direct=reverse.z<forward.z||(reverse.z==forward.z&&reverse.w<forward.w);
   vec4 options=readValue(styleData,7);
-  if(options.x>.5&&reverse.z!=forward.z&&reverse.z>=0.0&&forward.z>=0.0){
+  bool wave=readValue(styleData,18).x!=0.0;
+  if((options.x>.5||wave)&&reverse.z!=forward.z&&reverse.z>=0.0&&forward.z>=0.0){
    vec4 a=viewProjection*vec4(readValue(vertexData,int(reverse.z)).xyz,1);
    vec4 b=viewProjection*vec4(readValue(vertexData,int(forward.z)).xyz,1);
    vec2 axis=vec2(cos(options.y),sin(options.y));
-   direct=dot(a.xy/max(a.w,.00001)*viewportInfo.xy,axis)<dot(b.xy/max(b.w,.00001)*viewportInfo.xy,axis);
+   vec2 start=a.xy/max(a.w,.00001)*viewportInfo.xy;
+   vec2 end=b.xy/max(b.w,.00001)*viewportInfo.xy;
+   direct=wave ? (start.x==end.x ? start.y<end.y : start.x<end.x) : dot(start,axis)<dot(end,axis);
   }
   float begin=direct?reverse.y-len:forward.y;
-  value=vec4(max(0.0,begin),max(0.0,begin+(direct?len:-len)),max(total,len),1);
+  // A half-edge stops at this endpoint if its tail has only its own length.
+  float ends=(reverse.y<=len?1.0:0.0)+(forward.y<=len?2.0:0.0);
+  value=vec4(max(0.0,begin),max(0.0,begin+(direct?len:-len)),max(total,len),ends);
  }
  int w=imageSize(metaOutput).x;imageStore(metaOutput,ivec2(id%w,id/w),value);
 }
@@ -114,7 +243,10 @@ def resources():
     if _shader:return _shader
     import gpu
     info=gpu.types.GPUShaderCreateInfo();info.local_group_size(64,1,1)
-    for slot,name in enumerate(('edgeData','extraNormals','topologyData','vertexData','adjacencyData','metaInput','styleData')):info.sampler(slot,'FLOAT_2D',name)
+    for slot,name in enumerate(('edgeData','extraNormals','topologyData','vertexData','adjacencyData','metaInput','styleData','sceneDepth')):info.sampler(slot,'FLOAT_2D',name)
+    # Preserve the draw shader's scene and object depth slots across compute.
+    info.sampler(11,'FLOAT_2D','jointData')
+    info.sampler(12,'FLOAT_2D','directionHeads')
     info.image(0,'RGBA32F','FLOAT_2D','metaOutput',qualifiers={'WRITE'})
     for kind,name in (('MAT4','viewProjection'),('VEC4','viewportInfo'),('VEC4','eyeInfo'),('VEC4','directionInfo'),('IVEC4','counts')):info.push_constant(kind,name)
     info.compute_source(SOURCE);_shader=gpu.shader.create_from_info(info);return _shader
@@ -130,6 +262,24 @@ def prepare(group):
     group['chain_views']={};group['chain_result_size']=(w,h)
 
 
+def _bind(group,projection,viewport,eye,direction,depth):
+    shader=resources();shader.bind()
+    shader.uniform_float('viewProjection',projection);shader.uniform_float('viewportInfo',viewport)
+    shader.uniform_float('eyeInfo',eye);shader.uniform_float('directionInfo',direction)
+    for name,key in (('edgeData','texture'),('extraNormals','normal_texture'),('topologyData','chain_edge_texture'),('vertexData','chain_vertex_texture'),('adjacencyData','chain_adjacency_texture'),('styleData','style_texture')):shader.uniform_sampler(name,group[key])
+    shader.uniform_sampler('sceneDepth',depth)
+    shader.uniform_sampler('jointData',group['joint_texture'])
+    shader.uniform_sampler('directionHeads',group.get('direction_heads',group['normal_texture']))
+    return shader
+
+
+def _dispatcher(shader,n,origin=(0,0)):
+    import gpu
+    def dispatch(mode,source,target,count):
+        shader.uniform_sampler('metaInput',source);shader.image('metaOutput',target);shader.uniform_int('counts',(n,mode,*origin));gpu.compute.dispatch(shader,(count+63)//64,1,1)
+    return dispatch
+
+
 def update(group,projection,viewport,eye,direction,area_id=0):
     import gpu
     n=len(group['records'])
@@ -140,20 +290,81 @@ def update(group,projection,viewport,eye,direction,area_id=0):
     if view is None:
         view={'texture':gpu.types.GPUTexture(group['chain_result_size'],format='RGBA32F'),'signature':None};group['chain_views'][area_id]=view
     group['chain_texture']=view['texture']
+    params=group['style']['params']
+    track_joints=(params[7,3]>0 or params[17,2]!=0) and params[6,2]==0
+    if track_joints and 'joints' not in view:
+        view['joints']=gpu.types.GPUTexture(group['chain_result_size'],format='RGBA32F')
+    group['joint_texture']=view.get('joints',view['texture'])
     if view['signature']==signature:return
-    shader=resources();shader.bind()
-    shader.uniform_float('viewProjection',projection);shader.uniform_float('viewportInfo',viewport)
-    shader.uniform_float('eyeInfo',eye);shader.uniform_float('directionInfo',direction)
-    for name,key in (('edgeData','texture'),('extraNormals','normal_texture'),('topologyData','chain_edge_texture'),('vertexData','chain_vertex_texture'),('adjacencyData','chain_adjacency_texture'),('styleData','style_texture')):shader.uniform_sampler(name,group[key])
+    shader=_bind(group,projection,viewport,eye,direction,group['normal_texture'])
     ping=group['chain_ping'];current=0;steps=max(1,math.ceil(math.log2(max(2,2*n))))
-    def dispatch(mode,source,target,count):
-        shader.uniform_sampler('metaInput',source);shader.image('metaOutput',target);shader.uniform_int('counts',(n,mode,0,0));gpu.compute.dispatch(shader,(count+63)//64,1,1)
+    dispatch=_dispatcher(shader,n)
     dispatch(1,group['texture'],ping[0],2*n)
+    if track_joints:dispatch(9,ping[0],view['joints'],n)
     for _ in range(steps):dispatch(2,ping[current],ping[1-current],2*n);current=1-current
     dispatch(3,ping[current],ping[1-current],2*n);current=1-current
     for _ in range(steps):dispatch(4,ping[current],ping[1-current],2*n);current=1-current
     dispatch(5,ping[current],group['chain_texture'],n)
     view['signature']=signature;group['chain_updates']=group.get('chain_updates',0)+1
+
+
+def visibility_minimum(group):
+    params=group['style']['params']
+    # Outline and Object use an additional depth test that is not in this pass.
+    return float(params[7,2]) if params[6,2]==0.0 else 0.0
+
+
+def update_visibility(group,projection,viewport,eye,direction,depth,area_id,origin=None):
+    import gpu
+    view=group['chain_views'][area_id]
+    # Preview snapshots own both the chain and the occluder geometry.
+    signature=view['signature'] if origin is None else None
+    if signature is not None and view.get('visibility_signature')==signature:
+        return view['visibility']
+    if 'visibility' not in view:
+        view['visibility']=gpu.types.GPUTexture(group['chain_result_size'],format='RGBA32F')
+    n=len(group['records'])
+    shader=_bind(group,projection,viewport,eye,direction,depth)
+    dispatch=_dispatcher(shader,n,origin or (0,0))
+    ping=group['chain_ping'];current=0
+    dispatch(6,group['texture'],ping[0],2*n)
+    for _ in range(max(1,math.ceil(math.log2(max(2,2*n))))):
+        dispatch(7,ping[current],ping[1-current],2*n);current=1-current
+    dispatch(8,ping[current],view['visibility'],n)
+    view['visibility_signature']=signature
+    return view['visibility']
+
+
+def update_normal_directions(group,projection,viewport,eye,direction,depth,area_id,cache=False):
+    import gpu
+    view=group['chain_views'][area_id]
+    signature=view['signature'] if cache else None
+    if signature is not None and view.get('normal_signature')==signature:
+        return view['normal_directions']
+    if 'normal_directions' not in view:
+        view['normal_directions']=gpu.types.GPUTexture(group['chain_result_size'],format='RGBA32F')
+    n=len(group['records'])
+    ping=group['chain_ping']
+    if 'direction_heads' not in group:
+        group['direction_heads']=gpu.types.GPUTexture((ping[0].width,ping[0].height),format='RGBA32F')
+    heads=group['direction_heads']
+    shader=_bind(group,projection,viewport,eye,direction,depth)
+    dispatch=_dispatcher(shader,n)
+    # Do not bind the output head texture as an input during its write.
+    shader.uniform_sampler('directionHeads',group['normal_texture'])
+    dispatch(10,group['texture'],heads,2*n)
+    shader.uniform_sampler('directionHeads',heads)
+    steps=max(1,math.ceil(math.log2(max(2,2*n))))
+    dispatch(11,heads,ping[0],2*n)
+    current=0
+    for _ in range(steps-1):
+        dispatch(11,ping[current],ping[1-current],2*n);current=1-current
+    dispatch(13,ping[current],ping[1-current],2*n);current=1-current
+    for _ in range(steps):
+        dispatch(11,ping[current],ping[1-current],2*n);current=1-current
+    dispatch(12,ping[current],view['normal_directions'],n)
+    view['normal_signature']=signature
+    return view['normal_directions']
 
 
 def reset():

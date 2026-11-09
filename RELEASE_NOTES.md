@@ -1,3 +1,20 @@
+## 0.28.14 — GPU 렌더 영역, 스테레오, 모션 블러와 피사계 심도
+
+- **Render Region**과 **Crop to Render Region**을 GPU 라인 전용 렌더와 F12 합성에서 지원합니다. 자르기를 끄면 지정 영역 밖이 투명한 전체 캔버스를 출력합니다.
+- **Stereo 3D**에서는 좌·우 눈별 카메라와 깊이로 GPU 선을 렌더하고 각 눈의 장면 이미지에 합성합니다.
+- **Motion Blur**와 카메라의 **Depth of Field**를 켠 상태로 F12 합성 렌더를 할 수 있습니다. Pencil+ 비교 결과와 같이, 장면에는 셔터와 조리개 효과가 적용되고 GPU 선은 현재 프레임의 선명한 투영을 유지합니다.
+- GPU의 선 연결, 가림 경계, 파형 왜곡과 AA를 개선했습니다. **Line** 패널에서 **Antialiasing**과 **Oversampling**을, **Preview & Render**에서 **Pencil-like Simple** 굵기 프로필을 선택할 수 있습니다.
+
+### 설치와 데모
+
+Blender 4.4 이상에서 **Edit → Preferences → Add-ons → Install from Disk**로 설치 ZIP을 선택하세요. 기존 설치에서는 **업데이트 확인 → 새 버전 다운로드**를 사용한 뒤 Blender를 다시 시작할 수 있습니다.
+
+`rea_motion_blur_dof_demo.blend`를 열고 **24프레임에서 F12**를 누르세요. 청록색 물체의 움직임과 초점 전후의 조리개 흐림을 볼 수 있습니다. 장면 안의 `REA_DEMO_README` 텍스트에 비교 방법을 넣었습니다.
+
+### 검증 범위
+
+Blender 4.4에서 EEVEE와 Cycles의 좌·우 합성, 모션 블러와 피사계 심도, 그리고 렌더 영역 자르기를 검증했습니다. GPU 렌더는 단일 뷰 레이어를 지원합니다. 사용자 지정 멀티뷰와 선 자체의 시간·조리개 샘플링은 지원 범위 밖이며, Pencil+와 선 끝·가림 경계·AA에는 차이가 있습니다.
+
 ## 0.28.13 — F12 GPU 선 렌더
 
 - **F12**와 REA의 **Render** 버튼으로 EEVEE/Cycles 장면에 자체 GPU 선을 합성합니다. REA 그래프가 없는 장면에서는 F12가 Blender 기본 렌더를 실행합니다. REA 그래프가 있는 장면은 **F12 GPU 선 렌더**를 끄면 기존 경로를 사용할 수 있습니다.

@@ -22,7 +22,7 @@ def render(scene, *, write_still=False):
     hidden = []
     rewired = []
     node_states = []
-    image = None
+    images = []
     try:
         with ui.suspend_sync():
             scene.lea_line.auto_sync = False
@@ -36,13 +36,21 @@ def render(scene, *, write_still=False):
         line = gpu_render.render_lines(scene, capture=True)
         if line['status'] == 'cancelled':
             return line
-        pixels = line.pop('pixels')
-        image = bpy.data.images.new('.REA GPU line composite', width=pixels.shape[1],
-            height=pixels.shape[0], alpha=True, float_buffer=True)
-        image.alpha_mode = 'PREMUL'
-        image.pixels.foreach_set(pixels.ravel())
-        image.update()
-        del pixels
+        buffers = line.pop('views', None)
+        if buffers is None:
+            buffers = {'': line.pop('pixels')}
+        height, width = next(iter(buffers.values())).shape[:2]
+        texture_limit = line.get('gpu_texture_limit')
+        if texture_limit and max(width,height) > texture_limit:
+            # EEVEE/Workbench allocate full-frame GPU buffers. EEVEE can
+            # return a saved image with no beauty pass when this check fails.
+            if scene.render.engine != 'CYCLES':
+                raise ValueError(
+                    f'{width} × {height} 장면이 Blender 렌더 엔진의 GPU 텍스처 한도 '
+                    f'({texture_limit}px)를 초과합니다. Cycles로 합성하거나 GPU 라인만 렌더하세요.')
+            if scene.render.compositor_device == 'GPU':
+                flags['compositor_device'] = scene.render.compositor_device
+                scene.render.compositor_device = 'CPU'
         scene.use_nodes = True
         graph = scene.node_tree
         if old_nodes:
@@ -74,14 +82,30 @@ def render(scene, *, write_still=False):
             for node in outputs:
                 graph.links.new(source.outputs['Image'], node.inputs['Image'])
             sources = [source]
-        ink = graph.nodes.new('CompositorNodeImage')
-        ink.image = image
+        switch = None
+        if len(buffers)>1:
+            with bpy.context.temp_override(scene=scene):
+                switch = graph.nodes.new('CompositorNodeSwitchView')
+        for view in tuple(buffers):
+            pixels = buffers.pop(view)
+            name = f'.REA GPU line composite {view}'.rstrip()
+            image = bpy.data.images.new(name, width=width, height=height, alpha=True, float_buffer=True)
+            images.append(image)
+            image.alpha_mode = 'PREMUL'
+            image.pixels.foreach_set(pixels.ravel())
+            image.update()
+            del pixels
+            ink = graph.nodes.new('CompositorNodeImage')
+            ink.image = image
+            if switch is not None:
+                graph.links.new(ink.outputs['Image'], switch.inputs[view])
+        ink_output = (switch if switch is not None else ink).outputs['Image']
         for source in sources:
             outgoing = [(l.from_socket, l.to_socket) for l in source.outputs['Image'].links]
             over = graph.nodes.new('CompositorNodeAlphaOver')
             over.inputs[0].default_value = 1.
             graph.links.new(source.outputs['Image'], over.inputs[1])
-            graph.links.new(ink.outputs['Image'], over.inputs[2])
+            graph.links.new(ink_output, over.inputs[2])
             for a, b in outgoing:
                 if source.as_pointer() in original_ids:
                     rewired.append((a, b))
@@ -106,7 +130,7 @@ def render(scene, *, write_still=False):
                 if alpha is not None:
                     node.use_alpha = alpha
             graph.nodes.active = old_active
-        if image is not None:
+        for image in images:
             bpy.data.images.remove(image)
         gpu_render._restore_grease_pencils(hidden)
         for k, value in flags.items():

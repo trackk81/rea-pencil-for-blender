@@ -35,7 +35,7 @@ def render():
  assert report['status']=='ok',report
  assert flags==(s.render.engine,s.render.use_freestyle,s.render.use_compositing,s.render.use_sequencer,s.lea_line.auto_sync)
  assert gp.hide_render is False and gp_hidden.hide_render is True
- assert not gpu_render._grease_pencil_scopes
+ assert not gpu_render._line_render_scopes
  image=bpy.data.images.load(s.render.filepath,check_existing=False);rgba=np.array(image.pixels[:]).reshape(image.size[1],image.size[0],4);bpy.data.images.remove(image)
  return rgba,report
 a,base=render();assert a[:,:,3].sum()>100
@@ -47,12 +47,18 @@ im=bpy.data.images.load(s.render.filepath,check_existing=False);no_gp=np.array(i
 assert np.array_equal(a,no_gp)
 checks['native_GP_excluded_and_all_object_flags_restored']=True
 old_engine=s.render.engine;s.render.engine='REA_PENCIL_GPU';s.render.filepath=str(OUT/'direct.png')
+s.use_nodes=True
+graph=s.node_tree
+graph.nodes.clear()
+rgb=graph.nodes.new('CompositorNodeRGB');rgb.outputs[0].default_value=(1,1,1,1)
+composite=graph.nodes.new('CompositorNodeComposite');graph.links.new(rgb.outputs[0],composite.inputs['Image'])
 bpy.ops.render.render(write_still=True)
-assert gp.hide_render is False and gp_hidden.hide_render is True and not gpu_render._grease_pencil_scopes
+assert gp.hide_render is False and gp_hidden.hide_render is True and not gpu_render._line_render_scopes
+assert s.render.use_compositing and s.render.use_sequencer
 im=bpy.data.images.load(s.render.filepath,check_existing=False);direct=np.array(im.pixels[:]).reshape(im.size[1],im.size[0],4);bpy.data.images.remove(im)
 assert np.array_equal(a,direct)
-s.render.engine=old_engine
-checks['direct_engine_excludes_GP_without_Freestyle_sync']=True
+s.render.engine=old_engine;s.use_nodes=False
+checks['direct_engine_excludes_GP_and_postprocessing_without_Freestyle_sync']=True
 bulk=gpu_render.publish
 gpu_render.publish=lambda layer,rgba:setattr(layer.passes['Combined'],'rect',rgba.reshape(-1,4))
 reference,_=render();gpu_render.publish=bulk
@@ -78,18 +84,33 @@ for w,h in ((128,256),(512,128)):
  actual=(x.min(),x.max()+1,y.min(),y.max()+1)
  assert max(abs(v-e) for v,e in zip(actual,expected))<3,(actual,expected)
 checks['portrait_landscape_projection_alignment']=True
+s.render.resolution_x,s.render.resolution_y,s.render.resolution_percentage=421,317,73
+full,_=render()
+s.render.use_border=True
+s.render.border_min_x,s.render.border_min_y=.117,.289
+s.render.border_max_x,s.render.border_max_y=.647,.714
+for crop in (False,True):
+ s.render.use_crop_to_border=crop
+ rgba,region=render()
+ assert region['render_window']==[35,66,198,164]
+ expected=full[66:164,35:198] if crop else np.zeros_like(full)
+ if not crop:expected[66:164,35:198]=full[66:164,35:198]
+ assert rgba.shape==expected.shape and np.max(np.abs(rgba-expected)) <= 1.01/255
+s.render.use_border=s.render.use_crop_to_border=False
+checks['render_region_and_crop_keep_full_camera_projection_in_saved_line_output']=True
 with ui.suspend_sync():detail.caps='BUTT'
 try:render();raise AssertionError('Unsupported cap accepted')
 except RuntimeError:pass
 assert s.render.engine=='BLENDER_EEVEE_NEXT' and s.lea_line.auto_sync
-assert gp.hide_render is False and not gpu_render._grease_pencil_scopes
+assert gp.hide_render is False and not gpu_render._line_render_scopes
 checks['GP_restored_after_render_failure']=True
 with ui.suspend_sync():detail.caps='ROUND'
 old_engine=s.render.engine;s.render.engine='REA_PENCIL_GPU'
 gpu_render._render_init(s);assert gp.hide_render is True
 for callback in bpy.app.handlers.render_cancel:
  if callback==gpu_render._render_end:callback(s)
-assert gp.hide_render is False and gp_hidden.hide_render is True and not gpu_render._grease_pencil_scopes
+assert gp.hide_render is False and gp_hidden.hide_render is True and not gpu_render._line_render_scopes
+assert s.render.use_compositing and s.render.use_sequencer
 s.render.engine=old_engine
 checks['GP_restored_by_registered_cancel_handler']=True
 checks['unsupported_style_errors_without_freestyle_and_restores_settings']=True

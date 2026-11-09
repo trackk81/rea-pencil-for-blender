@@ -73,6 +73,111 @@ s.use_nodes=True;comp.mute=False;comp.use_alpha=True;file.mute=True
 s.render.engine='CYCLES';s.cycles.device='CPU';s.cycles.samples=2
 run('cycles');s.render.engine='BLENDER_EEVEE_NEXT'
 checks['Cycles_beauty_with_GPU_lines']=True
+def result_pixels():
+ im=bpy.data.images.load(s.render.filepath,check_existing=False)
+ pixels=np.array(im.pixels[:]).reshape(im.size[1],im.size[0],4)
+ bpy.data.images.remove(im)
+ return pixels
+run('region_reference')
+full=result_pixels()
+s.render.use_border=True
+s.render.border_min_x,s.render.border_min_y=.173,.209
+s.render.border_max_x,s.render.border_max_y=.691,.757
+for crop in (False,True):
+ s.render.use_crop_to_border=crop
+ run('region_cropped' if crop else 'region_full_canvas')
+ region=result_pixels()
+ assert s.render.use_border and s.render.use_crop_to_border==crop
+ if not crop:
+  outside=region[:,:,3].copy();outside[40:145,44:176]=0
+  assert not outside.any()
+  region=region[40:145,44:176]
+ assert region.shape==(105,132,4)
+ assert np.max(np.abs(region-full[40:145,44:176])) <= 1.01/255
+s.render.use_border=s.render.use_crop_to_border=False
+checks['compositor_aligns_the_asymmetric_render_region_with_or_without_crop']=True
+
+s.camera.data.type='PERSP'
+stereo=s.camera.data.stereo
+stereo.pivot='CENTER'
+stereo.convergence_mode='OFFAXIS'
+stereo.interocular_distance=.8
+stereo.convergence_distance=3
+s.camera.data.lens=35
+s.render.views_format='STEREO_3D'
+s.render.use_multiview=True
+s.render.image_settings.views_format='INDIVIDUAL'
+grade.inputs['Bright'].default_value=0
+for crop in (False,True):
+ s.render.use_border=s.render.use_crop_to_border=crop
+ preview.hide_render=True
+ try:line=gpu_render.render_lines(s,capture=True)
+ finally:preview.hide_render=False
+ assert line['view_names']==['left','right']
+ assert np.max(np.abs(line['views']['left']-line['views']['right']))>.1, (crop,line['alpha_mass'],line['render_window'])
+ label='stereo_crop' if crop else 'stereo_full'
+ run(label)
+ for view in s.render.views:
+  if not view.use:continue
+  im=bpy.data.images.load(str(OUT/(label+view.file_suffix+'.png')),check_existing=False)
+  combined=np.array(im.pixels[:]).reshape(im.size[1],im.size[0],4)
+  bpy.data.images.remove(im)
+  ink=line['views'][view.name]
+  other=line['views']['right' if view.name=='left' else 'left']
+  assert combined.shape==ink.shape
+  exclusive=(ink[:,:,3]>.4)&(other[:,:,3]==0)
+  assert exclusive.sum()>10
+  assert np.median(combined[:,:,0][exclusive])>.5
+s.render.use_multiview=False
+s.render.use_border=s.render.use_crop_to_border=False
+s.camera.data.type='ORTHO'
+grade.inputs['Bright'].default_value=2
+checks['stereo_composite_routes_each_eye_to_its_own_lines_with_and_without_crop']=True
+
+for frame,x in ((1,-.8),(3,.8)):
+ cube.location.x=x
+ cube.keyframe_insert(data_path='location',index=0,frame=frame)
+for curve in cube.animation_data.action.fcurves:
+ for key in curve.keyframe_points:key.interpolation='LINEAR'
+s.frame_set(2)
+s.render.motion_blur_shutter=.9
+s.render.motion_blur_position='CENTER'
+line_passes=[];combined_passes=[]
+for blur in (False,True):
+ s.render.use_motion_blur=blur
+ preview.hide_render=True
+ try:line_passes.append(gpu_render.render_lines(s,capture=True)['pixels'])
+ finally:preview.hide_render=False
+ run('moving_blurred' if blur else 'moving_sharp')
+ combined_passes.append(result_pixels())
+ assert s.frame_current==2 and s.render.use_motion_blur==blur
+ assert abs(s.render.motion_blur_shutter-.9)<1e-6 and s.render.motion_blur_position=='CENTER'
+assert np.array_equal(*line_passes)
+assert np.count_nonzero((combined_passes[0][:,:,3]==0)&(combined_passes[1][:,:,3]>.04))>100
+s.render.use_motion_blur=False
+checks['motion_blur_changes_the_beauty_pass_while_ink_uses_the_current_frame']=True
+
+s.camera.data.type='PERSP'
+dof=s.camera.data.dof
+focus=bpy.data.objects.new('Focus target',None)
+focus.location.z=3
+s.collection.objects.link(focus)
+dof.focus_object=focus
+dof.aperture_fstop=.15
+line_passes=[];combined_passes=[]
+for blur in (False,True):
+ dof.use_dof=blur
+ preview.hide_render=True
+ try:line_passes.append(gpu_render.render_lines(s,capture=True)['pixels'])
+ finally:preview.hide_render=False
+ run('lens_blurred' if blur else 'lens_sharp')
+ combined_passes.append(result_pixels())
+ assert dof.use_dof==blur and dof.focus_object==focus and abs(dof.aperture_fstop-.15)<1e-6
+assert np.array_equal(*line_passes)
+assert np.count_nonzero((combined_passes[0][:,:,3]==0)&(combined_passes[1][:,:,3]>.04))>100
+dof.use_dof=False
+checks['depth_of_field_blurs_the_beauty_pass_while_ink_keeps_its_projection']=True
+
 invoke=gpu_composite._render_beauty
 def failure(*args):raise RuntimeError('simulated beauty failure')
 gpu_composite._render_beauty=failure

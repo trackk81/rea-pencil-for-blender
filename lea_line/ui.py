@@ -13,18 +13,20 @@ from bpy.props import (
 )
 from .brush_detail import LEABrushDetailNode, initialize_from_brush
 from . import independent_reduction
+from .routing import GPU_ONLY_EDGE_FEATURES
 
 
 _sync_busy = False
 OVERRIDE_FEATURES = (
     "outline", "border", "crease", "material_boundary", "edge_mark",
     "ridge_valley", "suggestive_contour",
-)
+) + GPU_ONLY_EDGE_FEATURES
 OVERRIDE_SOCKET_NAMES = tuple(
     f"{prefix}{feature} Brush"
     for prefix in ("", "Hidden ") for feature in OVERRIDE_FEATURES
 )
 EDGE_FEATURES = OVERRIDE_FEATURES + ("intersection",)
+HIDDEN_NORMAL_ANGLE_FIELDS = ('hidden_normal_angle_min', 'hidden_normal_angle_max')
 
 
 @contextmanager
@@ -53,10 +55,13 @@ def _hidden_selection_changed(node, context=None):
     # control does not change the image. Later toggles retain the authored values.
     if node.independent_hidden_edges and not node.get('rea_hidden_edges_initialized', False):
         with suspend_sync():
-            for feature in EDGE_FEATURES:
+            for feature in EDGE_FEATURES + ('outline_open', 'outline_merge_groups', 'object_open'):
                 name = 'hidden_' + feature
                 if not node.is_property_set(name):
                     setattr(node, name, getattr(node, feature))
+            for name in HIDDEN_NORMAL_ANGLE_FIELDS:
+                if name not in node:
+                    setattr(node, name, getattr(node, name.removeprefix('hidden_')))
             node['rea_hidden_edges_initialized'] = True
     _sync_if_enabled(node, context)
 
@@ -171,7 +176,12 @@ def _preview_changed(settings, context):
 class LEALineSettings(bpy.types.PropertyGroup):
     f12_gpu_lines: BoolProperty(name='F12 GPU Lines', description='F12로 REA GPU 선과 장면을 합성합니다. REA 그래프가 없는 장면은 기본 렌더를 사용합니다', default=True)
     fast_line_art: BoolProperty(name="Line Art Render (Experimental)", description="Alternative rendering for intersections and potential speed gains; different strokes, limited brush support; F12 stays normal", default=False)
-    stroke_width_profile: EnumProperty(name="Stroke Coverage", description="Line Art final render only; choose geometric width or empirical coverage matched to the original Simple brush", items=[("PHYSICAL", "Geometric Width", "Keep geometric pixel width; existing behavior"), ("PENCIL_SIMPLE", "Pencil-like Simple", "Empirical wider coverage measured from the original Simple brush; not full brush parity")], default="PHYSICAL")
+    stroke_width_profile: EnumProperty(
+        name="Stroke Coverage",
+        description="Coverage for GPU Simple strokes of constant width and opacity and for Line Art renders",
+        items=[("PHYSICAL", "Geometric Width", "Use the authored pixel width"),
+               ("PENCIL_SIMPLE", "Pencil-like Simple", "Use coverage measured from the original Simple brush")],
+        default="PHYSICAL", update=_preview_changed)
     line_art_aa: EnumProperty(name="Edge Smoothing", description="Line Art final render only; crisp edges can look stair-stepped", items=[('SCENE', 'Scene SMAA', 'Keep the scene Grease Pencil antialiasing setting'), ('CRISP', 'Crisp Edges', 'Disable SMAA filtering; sharper coverage but more jagged edges')], default='SCENE')
     reuse_line_pass: BoolProperty(name="Reuse Unchanged Lines (Experimental)", description="Eevee, one view layer, simple compositor only. Uses a separate line pass with potentially different edge antialiasing. F12 stays a normal render", default=False)
     tree: PointerProperty(name="Line Graph", type=bpy.types.NodeTree, poll=_tree_poll, update=_sync_if_enabled)
@@ -251,6 +261,10 @@ class LEAOutputNode(_LEANode, bpy.types.Node):
 
     enabled: BoolProperty(name="Enabled", default=True, update=_sync_if_enabled)
     render_priority: IntProperty(name='Render Priority', default=0, update=_sync_if_enabled)
+    antialiasing: FloatProperty(name='Antialiasing', min=0, max=2, default=1, update=_sync_if_enabled,
+        description='GPU line edge filter. Higher values spread coverage into adjacent pixels')
+    over_sampling: IntProperty(name='Oversampling', min=1, max=4, default=1, update=_sync_if_enabled,
+        description='GPU approximation of the measured Pencil+ edge resolve. 1 preserves existing REA output')
     width_mode: EnumProperty(name='Line Size', items=[('INHERIT', 'Scene Default', 'Preserve legacy scene width settings'),
         ('ABSOLUTE', 'Absolute', 'Fixed pixel widths for this Line'),
         ('RELATIVE', 'Relative (640*480)', 'Scale this Line with render height / 480')],
@@ -281,6 +295,8 @@ class LEAOutputNode(_LEANode, bpy.types.Node):
             return
         layout.prop(self, "enabled")
         layout.prop(self, 'render_priority')
+        layout.prop(self, 'antialiasing')
+        layout.prop(self, 'over_sampling')
 
 
 class LEAObjectTarget(bpy.types.PropertyGroup):
@@ -685,6 +701,35 @@ def _draw_line_brush(context, layout, node):
     return brush
 
 
+def _draw_normal_angle_range(layout, node, hidden):
+    prefix = 'hidden_' if hidden and node.independent_hidden_edges else ''
+    row = layout.row(align=True)
+    row.enabled = not hidden or node.independent_hidden_edges
+    row.prop(node, prefix + 'normal_angle_min', text='Min')
+    row.prop(node, prefix + 'normal_angle_max', text='Max')
+
+
+def _draw_outline_options(layout, node, hidden):
+    prefix = 'hidden_' if hidden and node.independent_hidden_edges else ''
+    row = layout.row()
+    row.enabled = not hidden or node.independent_hidden_edges
+    row.prop(node, prefix + 'outline_open', text='Open Edge (GPU)')
+    merge = layout.row()
+    merge.enabled = row.enabled
+    merge.prop(node, prefix + 'outline_merge_groups', text='Merge Groups (GPU)')
+    if not getattr(node, prefix + 'outline_open') and getattr(node, prefix + 'border'):
+        border = layout.row()
+        border.enabled = row.enabled
+        border.prop(node, prefix + 'border', text='Separate Open Border')
+
+
+def _draw_object_open(layout, node, hidden):
+    prefix = 'hidden_' if hidden and node.independent_hidden_edges else ''
+    row = layout.row()
+    row.enabled = not hidden or node.independent_hidden_edges
+    row.prop(node, prefix + 'object_open', text='Open Edge (GPU)')
+
+
 def _draw_edge_controls(context, layout, node):
     hidden = node.line_visibility == 'HIDDEN'
     layout.enabled = node.enabled and (node.hidden if hidden else node.visible)
@@ -693,10 +738,11 @@ def _draw_edge_controls(context, layout, node):
         if not node.independent_hidden_edges:
             layout.label(text='Uses visible edge types', icon='LINKED')
     prefix = 'hidden_' if hidden and node.independent_hidden_edges else ''
-    labels = (('outline', 'Outline'), ('border', 'Open Border'), ('intersection', 'Intersection'),
+    labels = (('outline', 'Outline'), ('object_edge', 'Object (GPU)'), ('border', 'Open Border'), ('intersection', 'Intersection'),
               ('material_boundary', 'Material ID Boundary'), ('edge_mark', 'Selected Edges'),
               ('crease', 'Normal Angle / Crease'), ('ridge_valley', 'Ridge & Valley'),
-              ('suggestive_contour', 'Suggestive Contour'))
+              ('suggestive_contour', 'Suggestive Contour'), ('wireframe', 'Wireframe'),
+              ('smoothing_boundary', 'Smoothing Boundary'))
     for feature, label in labels:
         row = layout.row()
         row.enabled = not hidden or node.independent_hidden_edges
@@ -707,8 +753,12 @@ def _draw_edge_controls(context, layout, node):
             continue
         subgroup = layout.box()
         subgroup.enabled = bool(getattr(node, prefix + feature))
-        if feature == 'crease':
-            subgroup.prop(node, 'crease_angle', text='Crease Angle')
+        if feature == 'outline':
+            _draw_outline_options(subgroup, node, hidden)
+        elif feature == 'object_edge':
+            _draw_object_open(subgroup, node, hidden)
+        elif feature == 'crease':
+            _draw_normal_angle_range(subgroup, node, hidden)
         socket_name = ('Hidden ' if hidden else '') + feature + ' Brush'
         row = subgroup.row(align=True)
         direct = _linked_node(node, socket_name, 'LEABrushNode')
@@ -716,7 +766,7 @@ def _draw_edge_controls(context, layout, node):
                       'CHECKBOX_HLT' if direct else 'CHECKBOX_DEHLT')
         if direct:
             _brush_action(row, node, socket_name, 'SELECT', direct.name, 'BRUSH_DATA')
-    layout.label(text='Crease angle shared across sets', icon='INFO')
+    layout.label(text='Min/Max: GPU · Native: shared visible Min', icon='INFO')
 
 
 def _draw_detail_button(header, brush):
@@ -776,6 +826,10 @@ class LEALineSetNode(_LEANode, bpy.types.Node):
     hidden: BoolProperty(name="Hidden Lines", default=False, update=_sync_if_enabled)
     independent_hidden_edges: BoolProperty(name="Independent Hidden Edges", description="Choose hidden edge types separately; disabled preserves the original shared selection", default=False, update=_hidden_selection_changed)
     outline: BoolProperty(name="Outline", default=True, update=_sync_if_enabled)
+    outline_open: BoolProperty(name="Open Edge", description="Include open mesh edges in Outline in GPU preview and rendering. Open Border is a separate category", default=True, update=_sync_if_enabled)
+    outline_merge_groups: BoolProperty(name="Merge Groups", description="Treat members of enabled REA Pencil Line Group collections as one object for GPU contours", default=False, update=_sync_if_enabled)
+    object_edge: BoolProperty(name="Object", description="Draw interior contours backed by the same object in GPU preview and rendering", default=False, update=_sync_if_enabled)
+    object_open: BoolProperty(name="Open Edge", description="Include open edges in Object contours in GPU preview and rendering", default=True, update=_sync_if_enabled)
     crease: BoolProperty(name="Crease", default=True, update=_sync_if_enabled)
     material_boundary: BoolProperty(name="Material Boundary", default=False, update=_sync_if_enabled)
     edge_mark: BoolProperty(name="Marked Edges", default=False, update=_sync_if_enabled)
@@ -783,7 +837,15 @@ class LEALineSetNode(_LEANode, bpy.types.Node):
     ridge_valley: BoolProperty(name="Ridge & Valley", default=False, update=_sync_if_enabled)
     suggestive_contour: BoolProperty(name="Suggestive Contour", default=False, update=_sync_if_enabled)
     intersection: BoolProperty(name="Intersection (Line Art)", description="Generate intersections in Line Art preview and experimental Line Art renders; unsupported by Freestyle", default=False, update=_sync_if_enabled)
+    wireframe: BoolProperty(name="Wireframe",
+        description="Draw shared mesh edges in GPU preview and rendering. If present, the Boolean Edge attribute pencil_wire_edge limits the selection",
+        default=False, update=_sync_if_enabled)
+    smoothing_boundary: BoolProperty(name="Smoothing Boundary", description="Draw shared sharp edges and shared edges touching a flat-shaded face (GPU)", default=False, update=_sync_if_enabled)
     hidden_outline: BoolProperty(name="Outline", default=True, update=_sync_if_enabled)
+    hidden_outline_open: BoolProperty(name="Open Edge", description="Include open mesh edges in hidden Outline in GPU preview and rendering", default=True, update=_sync_if_enabled)
+    hidden_outline_merge_groups: BoolProperty(name="Merge Groups", description="Use enabled REA Pencil Line Group collections for hidden GPU contours", default=False, update=_sync_if_enabled)
+    hidden_object_edge: BoolProperty(name="Object", description="Draw hidden interior contours backed by the same object in GPU preview and rendering", default=False, update=_sync_if_enabled)
+    hidden_object_open: BoolProperty(name="Open Edge", description="Include open edges in hidden Object contours in GPU preview and rendering", default=True, update=_sync_if_enabled)
     hidden_border: BoolProperty(name="Open Border", default=True, update=_sync_if_enabled)
     hidden_crease: BoolProperty(name="Crease", default=True, update=_sync_if_enabled)
     hidden_material_boundary: BoolProperty(name="Material Boundary", default=False, update=_sync_if_enabled)
@@ -791,10 +853,24 @@ class LEALineSetNode(_LEANode, bpy.types.Node):
     hidden_ridge_valley: BoolProperty(name="Ridge & Valley", default=False, update=_sync_if_enabled)
     hidden_suggestive_contour: BoolProperty(name="Suggestive Contour", default=False, update=_sync_if_enabled)
     hidden_intersection: BoolProperty(name="Intersection (Preview Only)", description="Hidden intersections in Line Art preview only; unsupported by Freestyle", default=False, update=_sync_if_enabled)
+    hidden_wireframe: BoolProperty(name="Wireframe",
+        description="Draw occluded shared mesh edges in GPU preview and rendering. If present, the Boolean Edge attribute pencil_wire_edge limits the selection",
+        default=False, update=_sync_if_enabled)
+    hidden_smoothing_boundary: BoolProperty(name="Smoothing Boundary", description="Draw occluded shared sharp edges and shared edges touching a flat-shaded face (GPU)", default=False, update=_sync_if_enabled)
     crease_angle: FloatProperty(name="Crease Angle", description="Freestyle has one shared crease angle per view layer; different line-set angles cannot be rendered independently", subtype="ANGLE", min=0.0, max=math.pi, default=math.radians(134), update=_sync_if_enabled)
-    normal_angle_min: FloatProperty(name='Min', description='Minimum normal angle; Max stays180degrees. Final Freestyle shares one angle per view layer',
+    normal_angle_min: FloatProperty(name='Min', description='Minimum angle between adjacent face normals. Native Freestyle shares one minimum per view layer',
         subtype='ANGLE', min=0., max=math.pi, get=lambda node: max(0., math.pi-node.crease_angle),
         set=lambda node,value: setattr(node,'crease_angle',math.pi-value))
+    normal_angle_max: FloatProperty(name='Max', description='Maximum angle between adjacent face normals (GPU preview and render)',
+        subtype='ANGLE', min=0., max=math.pi, default=math.pi, update=_sync_if_enabled)
+    hidden_normal_angle_min: FloatProperty(name='Min', description='Minimum normal angle for independent hidden edges (GPU preview and render)',
+        subtype='ANGLE', min=0., max=math.pi,
+        get=lambda node: node.get('hidden_normal_angle_min', node.normal_angle_min),
+        set=lambda node, value: node.__setitem__('hidden_normal_angle_min', value), update=_sync_if_enabled)
+    hidden_normal_angle_max: FloatProperty(name='Max', description='Maximum normal angle for independent hidden edges (GPU preview and render)',
+        subtype='ANGLE', min=0., max=math.pi,
+        get=lambda node: node.get('hidden_normal_angle_max', node.normal_angle_max),
+        set=lambda node, value: node.__setitem__('hidden_normal_angle_max', value), update=_sync_if_enabled)
     source_collection: PointerProperty(name="Collection", description="Limit object and material targets to this collection; leave empty for the scene", type=bpy.types.Collection, update=_sync_if_enabled)
     objects: CollectionProperty(name="Objects", description="Explicit object targets; an empty list uses the chosen collection or scene", type=LEAObjectTarget)
     object_index: IntProperty(name="Active Object Target", min=0, default=0)
@@ -1336,6 +1412,11 @@ class LEA_OT_duplicate_line_set(_LEATargetOperator, bpy.types.Operator):
             # Copy authored RNA fields, not backend ownership IDs/custom data.
             # Target collections need separate entries; object/material IDs stay shared.
             for name in LEALineSetNode.__annotations__:
+                if name in HIDDEN_NORMAL_ANGLE_FIELDS and name not in source:
+                    # The copied opt-in can initialize fields absent in older files.
+                    if name in node:
+                        del node[name]
+                    continue
                 if name not in {'objects', 'materials', 'normal_angle_min'}:
                     setattr(node, name, getattr(source, name))
             for target in source.objects:
@@ -1749,6 +1830,20 @@ def _draw_node_header(self, context):
             self.layout.operator("lea_line.apply", text="", icon="FILE_REFRESH")
 
 
+class LEA_PT_collection_line_group(bpy.types.Panel):
+    bl_label = 'REA Pencil Line Group'
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = 'collection'
+
+    @classmethod
+    def poll(cls, context):
+        return context.collection is not None
+
+    def draw(self, context):
+        self.layout.prop(context.collection, 'lea_line_merge_group', text='On')
+
+
 CLASSES = (
     LEALineSettings, LEALineTree, LEALineSocket,
     LEAObjectTarget, LEAMaterialTarget, LEA_UL_object_targets, LEA_UL_material_targets, LEA_UL_line_sets,
@@ -1761,12 +1856,12 @@ CLASSES = (
     LEA_OT_disconnect_line_set, LEA_OT_move_line_set,
     LEA_OT_new_graph, LEA_OT_apply, LEA_OT_add_line_set, LEA_OT_render, LEA_OT_render_lines,
     LEA_OT_refresh_preview,
-    LEA_PT_scene, LEA_MT_nodes, LEA_PT_node_settings, LEA_PT_feature_coverage,
+    LEA_PT_scene, LEA_MT_nodes, LEA_PT_node_settings, LEA_PT_feature_coverage, LEA_PT_collection_line_group,
 )
 
 
 def register():
-    from . import reference_panels, workflow_ui, target_dialog, node_workflow, texture_maps
+    from . import reference_panels, workflow_ui, target_dialog, node_workflow, texture_maps, gpu_preview
     registered = []
     menu = header = False
     try:
@@ -1774,6 +1869,9 @@ def register():
             bpy.utils.register_class(cls)
             registered.append(cls)
         bpy.types.Scene.lea_line = PointerProperty(type=LEALineSettings)
+        bpy.types.Collection.lea_line_merge_group = BoolProperty(
+            name='REA Pencil Line Group', default=False, override={'LIBRARY_OVERRIDABLE'},
+            description='Join this collection’s meshes for GPU Outline Merge Groups', update=gpu_preview.collection_changed)
         bpy.types.NODE_MT_add.append(_draw_node_add)
         menu = True
         bpy.types.NODE_HT_header.append(_draw_node_header)
@@ -1798,6 +1896,8 @@ def register():
             bpy.types.NODE_MT_add.remove(_draw_node_add)
         if registered and hasattr(bpy.types.Scene, 'lea_line'):
             del bpy.types.Scene.lea_line
+        if hasattr(bpy.types.Collection, 'lea_line_merge_group'):
+            del bpy.types.Collection.lea_line_merge_group
         for cls in reversed(registered):
             bpy.utils.unregister_class(cls)
         raise
@@ -1813,5 +1913,6 @@ def unregister():
     bpy.types.NODE_HT_header.remove(_draw_node_header)
     bpy.types.NODE_MT_add.remove(_draw_node_add)
     del bpy.types.Scene.lea_line
+    del bpy.types.Collection.lea_line_merge_group
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)

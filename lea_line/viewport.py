@@ -196,6 +196,12 @@ def sync_preview(scene, material_render=False):
     desired = set()
     warnings = gpu_warning + ['Live preview uses native Line Art; chaining and antialiasing differ from final Freestyle lines.']
     for index, (node, brush) in enumerate(specifications):
+        if routing.any_enabled(node, 'wireframe'):
+            warnings.append(f"{node.name}: Wireframe uses GPU preview or GPU render.")
+        if routing.any_enabled(node, 'smoothing_boundary'):
+            warnings.append(f"{node.name}: Smoothing Boundary uses GPU preview or GPU render.")
+        if routing.any_enabled(node, 'object_edge'):
+            warnings.append(f"{node.name}: Object contours use GPU preview or GPU render.")
         if free_view.dimensions(scene) and (material_scope.active(node) or node.use_material_functions):
             raise ValueError('Free View material-face evaluation is not yet verified; select Scene Camera')
         material_live = material_scope.active(node) and not material_render

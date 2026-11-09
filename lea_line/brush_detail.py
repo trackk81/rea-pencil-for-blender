@@ -137,14 +137,14 @@ class LEABrushDetailNode(bpy.types.Node):
     taper: BoolProperty(name='Endpoint Taper', description='Legacy endpoint thickness reduction; the editable size curve takes precedence when enabled', default=False, update=_changed)
     taper_start: FloatProperty(name='Start', description='Thickness fraction at stroke start', min=0, max=1, default=.2, update=_changed)
     taper_end: FloatProperty(name='End', description='Thickness fraction at stroke end', min=0, max=1, default=.2, update=_changed)
-    min_line_length: FloatProperty(name='Min Line Length', description='Exclude native chains shorter than this projected pixel length; 0 disables filtering', min=0, max=10000, default=0, subtype='PIXEL', update=_changed)
+    min_line_length: FloatProperty(name='Min Line Length', description='Exclude strokes shorter than this projected pixel length. GPU uses depth-split lengths for standard edges and full chains for object-depth tests or thresholds that exceed tile overlap. Zero disables filtering', min=0, max=10000, default=0, subtype='PIXEL', update=_changed)
     split_angle_enabled: BoolProperty(name='Split by Angle', description='Split Freestyle chains at a projected interior angle below the threshold', default=False, update=_changed)
     split_angle: FloatProperty(name='Line Split Angle', description='Projected interior angle; native Freestyle splitting may differ from Pencil+', min=0, max=math.pi, default=math.pi/2, subtype='ANGLE', update=_changed)
     original_split_angle: FloatProperty(name='Line Split Angle', description='Projected turn angle: sharper turns above this value split; complementary to the legacy interior-angle setting',
         min=0, max=math.pi, subtype='ANGLE',
         get=lambda self: max(0.0,min(math.pi,math.pi-self.split_angle)),
         set=lambda self,value: setattr(self,'split_angle',math.pi-value))
-    extend: FloatProperty(name='Extend', description='Native backbone extension at each stroke end, in pixels', min=0, max=10000, default=0, subtype='PIXEL', update=_changed)
+    extend: FloatProperty(name='Extend', description='Screen-space extension at each stroke end, in pixels. GPU extends solid round caps at chain ends and at depth cuts on standard edges', min=0, max=10000, default=0, subtype='PIXEL', update=_changed)
     line_direction_enabled: BoolProperty(name='Line Direction (Live)', description='Enable live open-chain direction in projected camera space; ties preserve order', default=False, update=_changed)
     line_direction: FloatProperty(name='Line Direction (Angle)', description='Live open-chain direction in projected camera space; ties preserve order', min=-math.pi, max=math.pi, default=-math.pi/6, subtype='ANGLE', update=_changed)
     loop_start: EnumProperty(name='Loop Start (Live)', description='Projected seam selection; original automatic edge selection remains different',

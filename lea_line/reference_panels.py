@@ -250,6 +250,8 @@ class LEA_PT_reference_line(_Panel, bpy.types.Panel):
         else:
             ref.enum(context, col, 'line', 'line_size_type', 'Line Size')
         col.separator()
+        col.prop(output, 'antialiasing')
+        col.prop(output, 'over_sampling')
         col.prop(output,'random_seed',text='Random Seed')
         col.label(text='Blender Render · F12', icon='RENDER_STILL')
 
@@ -354,14 +356,14 @@ class LEA_PT_reference_set_brush(_Panel, bpy.types.Panel):
 
 
 EDGE_ROWS = (
-    ('outline', 'Outline', 'outline', (('outline_open', 'Open Edge'), ('outline_merge_groups', 'Merge Groups'))),
-    ('object', 'Object', None, (('object_open', 'Open Edge'),)),
+    ('outline', 'Outline', 'outline', ()),
+    ('object', 'Object (GPU)', 'object_edge', ()),
     ('intersection', 'Intersection', 'intersection', (('intersection_self', 'Self-Intersection'),)),
-    ('smooth', 'Smoothing Boundary', None, ()),
+    ('smooth', 'Smoothing Boundary', 'smoothing_boundary', ()),
     ('material', 'Material ID Boundary', 'material_boundary', ()),
     ('selected', 'Selected Edges', 'edge_mark', ()),
-    ('normal_angle', 'Normal Angle', 'crease', (('normal_angle_min', 'Min'), ('normal_angle_max', 'Max'))),
-    ('wireframe', 'Wireframe', None, ()),
+    ('normal_angle', 'Normal Angle', 'crease', ()),
+    ('wireframe', 'Wireframe', 'wireframe', ()),
 )
 
 
@@ -396,13 +398,14 @@ class LEA_PT_reference_edge(_Panel, bpy.types.Panel):
             box = indent.split(factor=1.0).box().column(align=True)
             box.use_property_split = False
             box.enabled = bool(getattr(node, prop)) if prop else False
+            if source == 'outline':
+                ui._draw_outline_options(box, node, hidden)
+            elif source == 'object':
+                ui._draw_object_open(box, node, hidden)
+            elif source == 'normal_angle':
+                ui._draw_normal_angle_range(box, node, hidden)
             for child, caption in children:
-                if child == 'normal_angle_min':
-                    control = box.row()
-                    control.enabled = not hidden or node.independent_hidden_edges
-                    control.prop(node, 'normal_angle_min', text=caption)
-                else:
-                    ref.prop(context, box, 'line_set', prefix + child, text=caption)
+                ref.prop(context, box, 'line_set', prefix + child, text=caption)
             if supported in ui.OVERRIDE_FEATURES:
                 socket = ('Hidden ' if hidden else '') + supported + ' Brush'
                 direct = ui._linked_node(node, socket, 'LEABrushNode')
