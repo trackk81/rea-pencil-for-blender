@@ -9,6 +9,7 @@ import numpy as np
 from .gpu_depth import CENTER_DEPTH, MARKED_DEPTH, SPAN_LENGTH
 
 _shader=None
+MAX_WAVE_MASK_BYTES=2*1024*1024
 
 
 def texture(data):
@@ -90,6 +91,37 @@ bool projectEdge(int e,out vec4 p,out vec4 q){
 float edgeLength(int e){
  vec4 p,q;if(!projectEdge(e,p,q))return 0.0;
  return length((p.xy/p.w-q.xy/q.w)*viewportInfo.xy*.5);
+}
+vec4 waveMaskWord(int e,int word) {
+ vec4 p,q;
+ if(!projectEdge(e,p,q))return vec4(-1);
+ vec2 a=p.xy/p.w*viewportInfo.xy*.5+viewportInfo.xy*.5;
+ vec2 b=q.xy/q.w*viewportInfo.xy*.5+viewportInfo.xy*.5;
+ vec2 d=b-a;
+ float lengthValue=length(d);
+ vec4 span=readValue(metaInput,e);
+ // Endpoint runs already answer these edges without any interior march.
+ if(lengthValue<64.0 || span.z+span.w>=lengthValue-.0001)return vec4(-1);
+ int axis=abs(d.x)>=abs(d.y)?0:1;
+ if(abs(d[axis])<1e-5 || any(lessThan(min(a,b),vec2(.01))) ||
+    any(greaterThanEqual(max(a,b),viewportInfo.xy-.01)))return vec4(-1);
+ vec4 planes=markedDepthPlanes(viewProjection,viewportInfo.xy,p,q,edge(e,1).xyz-edge(e,0).xyz,edge(e,2),edge(e,3));
+ // The bilinear depth is continuous on this path. Keep the original search
+ // for sloped planes, where incident-face correction can jump at a tap.
+ if(any(notEqual(planes,vec4(0))))return vec4(-1);
+ uint visible=0u,hidden=0u;
+ vec2 depths=vec2(p.z/p.w,q.z/q.w)*.5+.5;
+ for(int bit=0;bit<32;++bit){
+  float at=float(word*32+bit)+.5;
+  float t=clamp((at-a[axis])/d[axis],0.0,1.0);
+  vec2 center=mix(a,b,t);
+  float z=mix(depths.x,depths.y,t);
+  float separation=z-centerDepth(center)-.000002;
+  // Uncertain texels enter both masks. The original scan will refine them.
+  if(separation<=.00000025)visible|=1u<<bit;
+  if(separation>=-.00000025)hidden|=1u<<bit;
+ }
+ return vec4(float(visible&65535u),float(visible>>16),float(hidden&65535u),float(hidden>>16));
 }
 vec4 initial(int halfEdge,bool cut,float anchor){
  int e=halfEdge/2,side=halfEdge%2;
@@ -181,6 +213,11 @@ vec4 directionResult(int e){
 }
 void main(){
  int id=int(gl_GlobalInvocationID.x),mode=counts.y;
+ if(mode==14){
+  int width=imageSize(metaOutput).x,e=id/width;
+  if(e<counts.x)imageStore(metaOutput,ivec2(id%width,e),waveMaskWord(e,id%width));
+  return;
+ }
  int limit=(mode==5||mode==8||mode==9||mode==12)?counts.x:counts.x*2;if(id>=limit)return;
  vec4 value;
  if(mode==1)value=initial(id,false,0.0);
@@ -280,6 +317,12 @@ def _dispatcher(shader,n,origin=(0,0)):
     return dispatch
 
 
+def tracks_joints(params):
+    if params[6,2] == 0:
+        return bool(params[7,3] or params[17,2])
+    return bool(params[18,0])
+
+
 def update(group,projection,viewport,eye,direction,area_id=0):
     import gpu
     n=len(group['records'])
@@ -291,7 +334,7 @@ def update(group,projection,viewport,eye,direction,area_id=0):
         view={'texture':gpu.types.GPUTexture(group['chain_result_size'],format='RGBA32F'),'signature':None};group['chain_views'][area_id]=view
     group['chain_texture']=view['texture']
     params=group['style']['params']
-    track_joints=(params[7,3]>0 or params[17,2]!=0) and params[6,2]==0
+    track_joints = tracks_joints(params)
     if track_joints and 'joints' not in view:
         view['joints']=gpu.types.GPUTexture(group['chain_result_size'],format='RGBA32F')
     group['joint_texture']=view.get('joints',view['texture'])
@@ -331,6 +374,17 @@ def update_visibility(group,projection,viewport,eye,direction,depth,area_id,orig
     for _ in range(max(1,math.ceil(math.log2(max(2,2*n))))):
         dispatch(7,ping[current],ping[1-current],2*n);current=1-current
     dispatch(8,ping[current],view['visibility'],n)
+    width,height=int(viewport[0]),int(viewport[1])
+    mask = None
+    if (group['style']['params'][18,0] and (origin is None or origin==(0,0))
+            and (depth.width,depth.height)==(width,height)):
+        words=(max(width,height)+31)//32
+        if 8<=n<=gpu.capabilities.max_texture_size_get() and words*n*16<=MAX_WAVE_MASK_BYTES:
+            mask=view.get('wave_mask')
+            if mask is None or (mask.width,mask.height)!=(words,n):
+                mask=gpu.types.GPUTexture((words,n),format='RGBA32F')
+            dispatch(14,view['visibility'],mask,words*n)
+    view['wave_mask']=mask
     view['visibility_signature']=signature
     return view['visibility']
 

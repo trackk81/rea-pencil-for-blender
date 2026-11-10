@@ -2,9 +2,11 @@
 import json
 import math
 import uuid
+from pathlib import Path
 import bpy
 from bpy.props import EnumProperty, StringProperty
 from .brush_detail import LEGACY_FIELDS, EXTRA_FIELDS
+from .stamp_brush import FIELDS as STAMP_FIELDS, PREVIEW_PATTERN
 
 CURVES_KEY = '_curves'
 CURVE_FLAGS = {'size_curve_enabled', 'alpha_curve_enabled'}
@@ -12,12 +14,24 @@ LOOP_FIELDS = {'loop_start', 'loop_orientation', 'dash_phase'}
 DIRECTION_FIELDS = {'line_direction_enabled', 'line_direction'}
 
 STORE_KEY = '_rea_detail_presets_v1'
+PENCIL_ASSET = '_rea_pencil_tip'
+PENCIL_FIELDS = tuple(name for name in STAMP_FIELDS if not name.startswith('distortion_'))
+PENCIL_TIPS = {
+    'graphite_grain': ('Graphite · Grain', {'brush_type': 'NORMAL', 'brush_map_opacity': .92}),
+    'dry_charcoal': ('Charcoal · Dry', {'brush_type': 'MULTIPLE', 'stamp_size': 32,
+        'stamp_size_random': 40, 'horizontal_space': .16, 'vertical_space': .13,
+        'horizontal_space_random': 45, 'vertical_space_random': 55}),
+    'soft_graphite': ('Graphite · Soft', {'brush_type': 'NORMAL', 'brush_map_opacity': .86,
+        'stretch': -.16}),
+}
+PENCIL_PATTERN = {'graphite_grain': (.35, .10), 'dry_charcoal': (.37, .13), 'soft_graphite': (.28, .045)}
 GROUPS = {'BRUSH': ('caps',),
           'STROKE': tuple(field for field in LEGACY_FIELDS if field != 'caps') + EXTRA_FIELDS}
 BUILTINS = {
     'BRUSH': {'round': ('Round', {'caps': 'ROUND'}),
               'flat': ('Flat', {'caps': 'BUTT'}),
-              'square': ('Square', {'caps': 'SQUARE'})},
+              'square': ('Square', {'caps': 'SQUARE'}),
+              **PENCIL_TIPS},
     'STROKE': {'solid': ('Solid', {}),
                'dashed': ('Dashed', {'dashed': True, 'dash': 10, 'gap': 5}),
                'long_dashes': ('Long Dashes', {'dashed': True, 'dash': 24, 'gap': 8}),
@@ -25,6 +39,60 @@ BUILTINS = {
                                  'distortion_wavelength': 100}),
                'taper': ('End Taper', {'taper': True, 'taper_start': .05, 'taper_end': .05})},
 }
+
+
+def _tip_id(group, preset_id):
+    if group == 'BRUSH' and preset_id.startswith('builtin:') and preset_id[8:] in PENCIL_TIPS:
+        return preset_id[8:]
+    return None
+
+
+def _linked_tip(detail):
+    socket = detail.inputs.get('Brush Map')
+    if not socket or not socket.is_linked:
+        return None
+    node = socket.links[0].from_node
+    if node.bl_idname == 'LEATextureMapNode' and node.image and node.get(PENCIL_ASSET) == node.image.get(PENCIL_ASSET):
+        return node.get(PENCIL_ASSET)
+    return None
+
+
+def _connect_tip(detail, tip):
+    socket = detail.inputs.get('Brush Map')
+    if socket is None:
+        raise ValueError('Brush Detail is missing its Brush Map input')
+    tree = detail.id_data
+    node = next((n for n in tree.nodes if n.bl_idname == 'LEATextureMapNode' and n.get(PENCIL_ASSET) == tip
+                 and n.image and n.image.get(PENCIL_ASSET) == tip), None)
+    if node is not None:
+        if not socket.is_linked or socket.links[0].from_node != node:
+            tree.links.new(node.outputs[0], socket)
+        return
+    image = next((image for image in bpy.data.images if image.get(PENCIL_ASSET) == tip), None)
+    created_image = image is None
+    node = None
+    try:
+        if created_image:
+            path = Path(__file__).with_name('brush_tips') / (tip + '.png')
+            image = bpy.data.images.load(str(path), check_existing=False)
+            image.name = 'REA ' + PENCIL_TIPS[tip][0]
+            image.colorspace_settings.name = 'Non-Color'
+            image.pack()
+            image[PENCIL_ASSET] = tip
+            image[PREVIEW_PATTERN] = PENCIL_PATTERN[tip]
+        node = tree.nodes.new('LEATextureMapNode')
+        node[PENCIL_ASSET] = tip
+        node.name = PENCIL_TIPS[tip][0]
+        node.location = (detail.location.x-290, detail.location.y)
+        node.image = image
+        node.wrap_mode_u = node.wrap_mode_v = 'CLIP'
+        tree.links.new(node.outputs[0], socket)
+    except Exception:
+        if node is not None:
+            tree.nodes.remove(node)
+        if created_image and image is not None and image.users == 0:
+            bpy.data.images.remove(image)
+        raise
 
 
 def _fields(group):
@@ -83,11 +151,13 @@ def _require_detail(tree_name, node_name):
     return node
 
 
-def _validated(detail, group, values):
+def _validated(detail, group, values, *, tip=None):
     if not isinstance(values, dict):
         raise ValueError('Preset fields do not match the supported group')
     scalar = {name: value for name, value in values.items() if name != CURVES_KEY}
     expected = set(_fields(group))
+    if tip:
+        expected.update(PENCIL_FIELDS)
     # Accept the exact scalar generations shipped in 0.8, 0.9-0.12 and 0.13.
     # Arbitrary missing-field combinations must not silently become presets.
     historical = (expected - DIRECTION_FIELDS,
@@ -127,7 +197,11 @@ def preset_values(detail, group, preset_id):
         entry = BUILTINS[group].get(preset_id[8:])
         if not entry:
             raise ValueError('Preset is no longer available')
-        return {**_defaults(detail, group), **entry[1]}
+        defaults = _defaults(detail, group)
+        if _tip_id(group, preset_id):
+            defaults.update({name: detail.bl_rna.properties[name].default for name in PENCIL_FIELDS})
+            defaults['brush_map_on'] = True
+        return {**defaults, **entry[1]}
     item = next((item for item in _read(detail.id_data)
                  if item['id'] == preset_id and item['group'] == group), None)
     if item is None:
@@ -154,8 +228,12 @@ def _animated_paths(animation, paths):
 
 def apply_preset(detail, group, preset_id):
     from . import ui
-    values = _validated(detail, group, preset_values(detail, group, preset_id))
+    raw = preset_values(detail, group, preset_id)
+    tip = _tip_id(group, preset_id)
+    values = _validated(detail, group, raw, tip=tip)
     scalar = {name: value for name, value in values.items() if name != CURVES_KEY}
+    if group == 'BRUSH' and preset_id == 'default' and _linked_tip(detail):
+        scalar.update(brush_type='SIMPLE', brush_map_on=False)
     # A preset must not appear applied while a driver/animation overrides it.
     if any(detail.is_property_readonly(name) for name in scalar):
         raise ValueError('Preset contains read-only properties')
@@ -166,7 +244,7 @@ def apply_preset(detail, group, preset_id):
     if CURVES_KEY in values:
         from . import curves
         curves.validate_import_target(detail)
-    before = snapshot(detail, group)
+    before = {name: getattr(detail, name) for name in scalar}
     with ui.suspend_sync():
         try:
             for name, value in scalar.items():
@@ -174,10 +252,11 @@ def apply_preset(detail, group, preset_id):
             if CURVES_KEY in values:
                 from . import curves
                 curves.import_detail(detail, values[CURVES_KEY])
+            if tip:
+                _connect_tip(detail, tip)
         except Exception:
             for name, value in before.items():
-                if name != CURVES_KEY:
-                    setattr(detail, name, value)
+                setattr(detail, name, value)
             raise
         detail[_selection_key(group)] = preset_id
     ui._sync_if_enabled(detail)
@@ -235,6 +314,9 @@ def _selected_label(detail, group):
     try:
         values = preset_values(detail, group, selected)
         current = snapshot(detail, group)
+        tip = _tip_id(group, selected)
+        if tip:
+            current.update({name: getattr(detail, name) for name in PENCIL_FIELDS})
         def equivalent(left, right):
             if isinstance(right, dict):
                 return (isinstance(left, dict) and left.keys() == right.keys()
@@ -244,7 +326,8 @@ def _selected_label(detail, group):
                         and all(equivalent(a, b) for a, b in zip(left, right)))
             return (math.isclose(left, right, rel_tol=1e-6, abs_tol=1e-6)
                     if type(right) in {int, float} and type(left) in {int, float} else left == right)
-        equal = all(equivalent(current[name], value) for name, value in values.items())
+        equal = (not tip or tip == _linked_tip(detail)) and all(
+            equivalent(current[name], value) for name, value in values.items())
     except ValueError:
         equal = False
     return label if equal else label + ' *'

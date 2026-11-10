@@ -12,13 +12,17 @@ def _signature(scene):
         return None
     from . import free_view
     entry=free_view._entries.get(scene.as_pointer())
-    if entry:return ('FREE',entry['area'],entry['dimensions'])
+    if entry:return ('FREE',entry['area'],entry['dimensions'],free_view.pixel_scale())
     from . import preview_camera
     camera = scene.camera
+    if not camera and not bpy.app.background:
+        view = free_view.available_view(scene)
+        return ('NO_SCENE_CAMERA', view[0].as_pointer() if view else None)
     if not camera or camera.data.type not in {'ORTHO', 'PERSP'}:
         return ('unsupported', camera.as_pointer() if camera else None,
                 camera.data.type if camera else None)
-    return preview_camera.signature(scene)
+    view = free_view.available_view(scene) if free_view.wants_automatic(scene) else None
+    return ('CAMERA', preview_camera.signature(scene), view[0].as_pointer() if view else None)
 
 
 def mark_synced(scene):

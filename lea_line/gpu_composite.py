@@ -1,4 +1,4 @@
-"""Render beauty with the independent GPU line pass, preserving the scene graph."""
+"""Render beauty with the selected REA line pass, preserving the scene graph."""
 import time
 import bpy
 from . import gpu_render, ui
@@ -18,6 +18,8 @@ def render(scene, *, write_still=False):
     old_active = graph.nodes.active if graph else None
     flags = {k: getattr(scene.render, k) for k in
              ('engine', 'use_freestyle', 'use_compositing', 'use_sequencer')}
+    cpu_render = flags['engine'] == 'CYCLES' and scene.lea_line.cycles_cpu_render
+    cycles_device = scene.cycles.device if cpu_render else None
     old_auto = scene.lea_line.auto_sync
     hidden = []
     rewired = []
@@ -48,16 +50,16 @@ def render(scene, *, write_still=False):
                 raise ValueError(
                     f'{width} × {height} 장면이 Blender 렌더 엔진의 GPU 텍스처 한도 '
                     f'({texture_limit}px)를 초과합니다. Cycles로 합성하거나 GPU 라인만 렌더하세요.')
-            if scene.render.compositor_device == 'GPU':
-                flags['compositor_device'] = scene.render.compositor_device
-                scene.render.compositor_device = 'CPU'
+        if cpu_render or (texture_limit and max(width,height) > texture_limit):
+            flags['compositor_device'] = scene.render.compositor_device
+            scene.render.compositor_device = 'CPU'
         scene.use_nodes = True
         graph = scene.node_tree
         if old_nodes:
             sources = [n for n in graph.nodes if n.bl_idname == 'CompositorNodeRLayers'
                 and (n.scene is None or n.scene == scene) and n.layer in ('', scene.view_layers[0].name)]
             if not sources:
-                raise ValueError('GPU 선 합성에는 현재 장면의 Render Layers 노드가 필요합니다')
+                raise ValueError('REA 선 합성에는 현재 장면의 Render Layers 노드가 필요합니다')
         else:
             # Do not change dormant authored nodes when compositing was disabled.
             for node in graph.nodes:
@@ -88,7 +90,7 @@ def render(scene, *, write_still=False):
                 switch = graph.nodes.new('CompositorNodeSwitchView')
         for view in tuple(buffers):
             pixels = buffers.pop(view)
-            name = f'.REA GPU line composite {view}'.rstrip()
+            name = f".REA {line['line_backend']} line composite {view}".rstrip()
             image = bpy.data.images.new(name, width=width, height=height, alpha=True, float_buffer=True)
             images.append(image)
             image.alpha_mode = 'PREMUL'
@@ -113,9 +115,12 @@ def render(scene, *, write_still=False):
         scene.render.use_freestyle = False
         scene.render.use_compositing = True
         scene.render.use_sequencer = False
+        if cpu_render:
+            scene.cycles.device = 'CPU'
         operation = _render_beauty(scene, write_still)
         return {'status': 'cancelled' if 'CANCELLED' in operation else 'ok',
                 'seconds': time.perf_counter()-started, 'line_seconds': line['seconds'],
+                'line_backend': line['line_backend'],
                 'warnings': line['warnings'], 'excluded_line_helpers': [o.name for o, _ in hidden]}
     finally:
         if scene.node_tree:
@@ -135,6 +140,8 @@ def render(scene, *, write_still=False):
         gpu_render._restore_grease_pencils(hidden)
         for k, value in flags.items():
             setattr(scene.render, k, value)
+        if cycles_device is not None:
+            scene.cycles.device = cycles_device
         scene.use_nodes = old_nodes
         with ui.suspend_sync():
             scene.lea_line.auto_sync = old_auto

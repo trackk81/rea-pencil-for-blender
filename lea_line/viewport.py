@@ -49,7 +49,7 @@ def _owner(scene):
     if token and any(other != scene and other.get(OWNER_SCENE_KEY) == token for other in bpy.data.scenes):
         # Scene duplication copies ID properties and may link the same objects.
         # Detach the copy's old preview links before assigning it a fresh owner.
-        clear_preview(scene)
+        clear_preview(scene, keep_free_view=True)
         scene[OWNER_SCENE_KEY] = uuid.uuid4().hex
     if not scene.get(OWNER_SCENE_KEY):
         scene[OWNER_SCENE_KEY] = uuid.uuid4().hex
@@ -91,10 +91,12 @@ def _remove_object(scene, obj):
         bpy.data.grease_pencils_v3.remove(data)
 
 
-def clear_preview(scene):
+def clear_preview(scene, *, keep_free_view=False):
     """Remove only data explicitly tagged as this scene's preview assets."""
     from . import gpu_preview
     gpu_preview.stop(scene)
+    if not keep_free_view:
+        free_view.stop_automatic(scene)
     preview_material.cleanup(scene)
     owner = scene.get(OWNER_SCENE_KEY)
     if not owner:
@@ -186,15 +188,17 @@ def sync_preview(scene, material_render=False):
     if gpu_preview.active(scene) and not material_render:free_view.refresh(scene)
     gpu_preview.stop(scene)
     specifications = backend._specifications(tree)
+    reason = free_view.sync_automatic(scene, specifications) if not material_render else None
     if free_view.camera(scene) is None:
         clear_preview(scene)
-        return ["Viewport preview needs a scene camera; set the active camera first."]
+        return gpu_warning + [reason or "Render preparation needs an active scene camera."]
     if free_view.camera(scene).data.type not in {'PERSP', 'ORTHO'}:
         clear_preview(scene)
         return ["Live preview supports perspective and orthographic scene cameras."]
     owner = _owner(scene)
     desired = set()
-    warnings = gpu_warning + ['Live preview uses native Line Art; chaining and antialiasing differ from final Freestyle lines.']
+    warnings = gpu_warning + ([reason + ' 장면 카메라 기준으로 표시합니다.'] if reason else [])
+    warnings.append('일반 미리보기 · Blender Line Art · Pencil+와 선 선택·가림·AA 차이가 있을 수 있습니다.')
     for index, (node, brush) in enumerate(specifications):
         if routing.any_enabled(node, 'wireframe'):
             warnings.append(f"{node.name}: Wireframe uses GPU preview or GPU render.")
@@ -236,6 +240,11 @@ def sync_preview(scene, material_render=False):
             if deferred_override:
                 warnings.append(f"{node.name} ({visibility.lower()}): live feature brushes require a sole marked-edge, crease or material-boundary selection; this selection uses the common brush.")
             width = selected_brush.thickness * backend.width_scale(scene, node)
+            if free_view.dimensions(scene):
+                output = getattr(node, 'line_output', None)
+                mode = output.width_mode if output and output.width_mode != 'INHERIT' else scene.lea_line.width_mode
+                if mode == 'ABSOLUTE':
+                    width *= free_view.pixel_scale()
             key = f"{index}:{visibility}"
             desired.add(key)
             obj = _object(scene, owner, key)

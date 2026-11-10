@@ -7,6 +7,7 @@ use std::{mem, panic, ptr, slice};
 
 // Optional exports are versioned independently; the material ABI stays at1.
 mod ownership;
+mod cpu_lines;
 
 pub const ABI_VERSION: u32 = 1;
 const ALLOWED: u32 = 1;

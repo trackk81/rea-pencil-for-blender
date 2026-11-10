@@ -2,7 +2,7 @@
 import math
 import numpy as np
 import bpy
-from . import texture_maps,curves,object_uv
+from . import texture_maps,curves,object_uv,stamp_brush,stamp_coverage
 
 WRAP={'REPEAT':0,'CLAMP':1,'MIRROR':2,'MIRROR_ONCE':3,'CLIP':4}
 
@@ -29,6 +29,13 @@ def _set_edge_filter(params, output):
 
 def validate(brush):
     chosen=texture_maps.maps(brush)
+    if stamp_coverage.enabled(brush):
+        stamp_map = stamp_brush.detail_map(brush, 'brush')
+        if stamp_map and math.prod(stamp_map.image.size) > 16_777_216:
+            raise ValueError('GPU/CPU Brush Map은 16M 픽셀까지 지원합니다')
+        if (chosen or needs_chain(brush) or brush.offset_x or brush.offset_y or
+                brush.stamp_reduction_start != 1. or brush.stamp_reduction_end != 1.):
+            raise ValueError('GPU/CPU 질감 브러시는 추가 맵·점선·곡선·오프셋·스탬프 감소 없이 지원합니다')
     if set(chosen)-{'color','size'}:raise ValueError('GPU: 왜곡 맵·Line Functions는 Native를 사용하세요')
     for n in chosen.values():
         if n.source_type=='IMAGE':
@@ -71,7 +78,7 @@ def snapshot(brush,scale=1.,hidden=False,depth=False,*,output=None):
                 table[:,channel]=np.maximum(0,np.clip(values,payload['clip_min_y'],payload['clip_max_y']))
         finally:bpy.data.node_groups.remove(tree)
     table[:,1]=np.clip(table[:,1],0,1)
-    params=np.zeros((22,4),np.float32)
+    params=np.zeros((23,4),np.float32)
     _set_edge_filter(params, output)
     params[3]=(size_on,alpha_on,max(1.,float(table[:,0].max())),needs_chain(brush))
     params[4]=(bool(getattr(brush,'dashed',False)),max(.00001,getattr(brush,'dash',10)*scale),max(0,getattr(brush,'gap',5)*scale),getattr(brush,'dash_phase',0)*scale)
@@ -109,7 +116,19 @@ def snapshot(brush,scale=1.,hidden=False,depth=False,*,output=None):
                 rgba=images[kind];maximum=float(np.max((rgba[:,:,:3]@np.array((.2126,.7152,.0722)))*rgba[:,:,3]))
                 size_gain=max(1.,1-brush.size_map_amount+brush.size_map_amount*maximum)
     params[3,2]*=size_gain
-    return {'params':params,'curves':table,'maps':chosen,'images':images,'references':references,'needs_chain':needs_chain(brush)}
+    stamp_node = None
+    if stamp_coverage.enabled(brush):
+        stamp_node = stamp_brush.detail_map(brush, 'brush')
+        coverage, period = stamp_coverage.prepare(brush, brush.thickness * scale, stamp_node)
+        # Textured strokes reserve the otherwise unused Size Map sampler.
+        images['size'] = np.ascontiguousarray(np.repeat(coverage[:,:,None], 4, axis=2))
+        params[22,0] = period
+        params[3,3] = 1.
+    detail = getattr(brush, 'detail_source', None)
+    return {'params':params,'curves':table,'maps':chosen,'images':images,'references':references,
+            'needs_chain':bool(params[3,3]),'stamp_image':stamp_node.image if stamp_node else None,
+            'wave_detail':detail.as_pointer() if detail else None,
+            'wave_scale':scale,'wave_revision':0}
 
 
 def mesh_maps(mesh,payload,chosen):
@@ -152,14 +171,29 @@ def texture_rgba(array):
     return gpu.types.GPUTexture((w,h),format='RGBA32F',data=gpu.types.Buffer('FLOAT',array.size,array.ravel()))
 
 
+def curve_texture_data(style):
+    params = style['params']
+    # No shader branch reads the full lookup unless a stroke or distance
+    # curve is active. Simple object groups only need a bound sampler.
+    if np.any(params[3,:2]) or np.any(params[14,:2]):
+        return style['curves']
+    return style['curves'][:1]
+
+
+def upload_params(group):
+    style=group['style']
+    params=style['params'].copy();brush=group['brush']
+    params[0]=(*brush.color,brush.alpha);params[1]=group['size_reduction'];params[2]=group['alpha_reduction']
+    group['style_texture']=texture_rgba(params[None,:,:])
+    group['wave_revision']=style['wave_revision']
+
+
 def upload(group):
     from . import gpu_chain
     style=group.get('style')
     if style is None:style=group['style']=snapshot(group['brush'])
-    params=style['params'].copy();brush=group['brush']
-    params[0]=(*brush.color,brush.alpha);params[1]=group['size_reduction'];params[2]=group['alpha_reduction']
-    group['style_texture']=texture_rgba(params[None,:,:])
-    group['curve_texture']=texture_rgba(style['curves'][None,:,:])
+    upload_params(group)
+    group['curve_texture']=texture_rgba(curve_texture_data(style)[None,:,:])
     group['coordinate_texture']=gpu_chain.texture(group.get('map_coordinates',np.zeros((1,4),np.float32)))
     cache={}
     for kind in ('color','size'):
@@ -173,6 +207,18 @@ def upload(group):
 
 GLSL=r'''
 vec4 styleValue(int i){return texelFetch(styleData,ivec2(i,0),0);}
+float stampCoverage(float along,float cross,float diameter,float period) {
+    ivec2 size=textureSize(sizeImage,0);
+    vec2 uv=vec2(fract(along/period),cross/diameter+.5);
+    if (uv.y<0.0 || uv.y>1.0) return 0.0;
+    vec2 pos=uv*vec2(size)-.5, f=fract(pos);
+    ivec2 base=ivec2(floor(pos));
+    int x0=(base.x+size.x)%size.x, x1=(x0+1)%size.x;
+    int y0=clamp(base.y,0,size.y-1), y1=clamp(base.y+1,0,size.y-1);
+    float a=mix(texelFetch(sizeImage,ivec2(x0,y0),0).r,texelFetch(sizeImage,ivec2(x1,y0),0).r,f.x);
+    float b=mix(texelFetch(sizeImage,ivec2(x0,y1),0).r,texelFetch(sizeImage,ivec2(x1,y1),0).r,f.x);
+    return mix(a,b,f.y);
+}
 float hardEdge(float d) { return float(d>1e-5); }
 float halfOnBoundary(float d) { return abs(d)<=1e-5?.5:hardEdge(d); }
 float sampledHardEdge(float d,float rate) {

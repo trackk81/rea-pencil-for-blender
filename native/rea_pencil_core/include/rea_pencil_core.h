@@ -43,6 +43,50 @@ typedef struct rea_edge_owners_input_v1 {
 uint32_t rea_edge_owners_abi_version(void);
 int32_t rea_edge_owners_v1(const rea_edge_owners_input_v1 *input,
     uint8_t *output, size_t output_capacity);
+/* Optional CPU final line renderer. Buffers are detached, contiguous and
+ * borrowed for the duration of the call. Indices must be valid for the input.
+ * Prepare calls on distinct meshes may share one frame's atomic depth buffer.
+ * Join all prepares before drawing/freeing. Output is premultiplied RGBA32F,
+ * bottom row first. Rectangle coordinates are left, bottom, right, top.
+ * Create/prepare return NULL on error; draw returns SIZE_MAX.
+ */
+typedef struct rea_cpu_frame rea_cpu_frame;
+typedef struct rea_cpu_ink rea_cpu_ink;
+typedef struct rea_cpu_style_v2 {
+    uint32_t flags; /* 1 outline, 2 border, 4 crease, 8 reserve outline, 16 marked, 32 exclude marked */
+    float min_cos, max_cos, radius, aa, rgba[4];
+    const float *stamp; /* Optional tightly packed row-major coverage. Copied at create. */
+    size_t stamp_width, stamp_height;
+    float stamp_period;
+} rea_cpu_style_v2;
+typedef struct rea_cpu_mesh_v2 {
+    const float (*vertices)[3];
+    size_t vertex_count;
+    const uint32_t (*triangles)[3];
+    size_t triangle_count;
+    const uint32_t (*edges)[2];
+    size_t edge_count;
+    const uint32_t *loop_edges, *loop_vertices;
+    size_t loop_count;
+    const uint32_t *sizes;
+    const float (*normals)[3];
+    size_t face_count;
+    float projection[4][4], normal[3][3], eye[3];
+    uint32_t perspective;
+    float handedness;
+    uint32_t owner;
+    const uint32_t *style_ids;
+    size_t style_count;
+    const uint8_t *marks; /* Optional per-edge Freestyle selection marks. */
+} rea_cpu_mesh_v2;
+uint32_t rea_cpu_lines_abi_version(void);
+rea_cpu_frame *rea_cpu_lines_create(size_t width, size_t height,
+    const rea_cpu_style_v2 *styles, size_t count);
+rea_cpu_ink *rea_cpu_lines_prepare(const rea_cpu_frame *frame, const rea_cpu_mesh_v2 *mesh);
+size_t rea_cpu_lines_draw(const rea_cpu_frame *frame, const rea_cpu_ink *const *parts,
+    size_t count, const size_t (*rect)[4], float (*output)[4]);
+void rea_cpu_lines_free(rea_cpu_frame *frame);
+void rea_cpu_lines_free_mesh(rea_cpu_ink *mesh);
 #ifdef __cplusplus
 }
 #endif

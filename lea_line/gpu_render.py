@@ -16,6 +16,7 @@ LAST_RESULT = {}
 _capture_requested = False
 _captured_pixels = None
 _line_render_scopes = {}
+LINE_ENGINES = {'REA_PENCIL_GPU', 'REA_PENCIL_CPU'}
 
 
 def _exclude_grease_pencils(scene):
@@ -51,7 +52,7 @@ def _restore_line_scope(scene, objects, compositing, sequencer):
 @bpy.app.handlers.persistent
 def _render_init(scene, *args):
     # Cover direct engine/F12 invocation as well as the REA line-only button.
-    if scene.render.engine == 'REA_PENCIL_GPU':
+    if scene.render.engine in LINE_ENGINES:
         key = scene.as_pointer()
         if key not in _line_render_scopes:
             render = scene.render
@@ -88,6 +89,8 @@ def render_lines(scene, *, write_still=False, capture=False):
     # Combined result, even with compositor/sequencer/Freestyle disabled. A
     # REA-only output must exclude that extra pass for this invocation only.
     grease_pencils = []
+    cpu = flags['engine'] == 'REA_PENCIL_CPU' or (
+        flags['engine'] not in LINE_ENGINES and scene.lea_line.final_line_backend == 'CPU')
     started = time.perf_counter()
     LAST_RESULT = {}
     previous_capture = _capture_requested
@@ -96,7 +99,7 @@ def render_lines(scene, *, write_still=False, capture=False):
     try:
         with ui.suspend_sync():
             scene.lea_line.auto_sync = False
-        scene.render.engine = REA_GPU_LINE_ENGINE.bl_idname
+        scene.render.engine = REA_CPU_LINE_ENGINE.bl_idname if cpu else REA_GPU_LINE_ENGINE.bl_idname
         scene.render.use_freestyle = False
         scene.render.use_compositing = False
         scene.render.use_sequencer = False
@@ -105,12 +108,12 @@ def render_lines(scene, *, write_still=False, capture=False):
         if 'CANCELLED' in operation or LAST_RESULT.get('status') == 'cancelled':
             return {'status': 'cancelled', 'seconds': time.perf_counter()-started}
         if LAST_RESULT.get('status') != 'ok':
-            raise RuntimeError(LAST_RESULT.get('message', 'GPU line render did not complete'))
+            raise RuntimeError(LAST_RESULT.get('message', 'REA line render did not complete'))
         result = dict(LAST_RESULT, seconds=time.perf_counter()-started, warnings=[
-            '독립 GPU 선 렌더 · 메시 불투명 가림 판정 · 원본과 선 연결부/AA가 다릅니다'])
+            f'독립 {"CPU" if cpu else "GPU"} 선 렌더 · 메시 불투명 가림 판정 · 원본과 선 연결부/AA가 다릅니다'])
         if capture:
             if _captured_pixels is None:
-                raise RuntimeError('GPU line image was not captured')
+                raise RuntimeError('REA line image was not captured')
             result['views' if isinstance(_captured_pixels, dict) else 'pixels'] = _captured_pixels
         return result
     finally:
@@ -187,6 +190,13 @@ def draw(scene, depsgraph, entry, frame, bounds, *, world=None, shift_x=None):
     texture_limit = gpu.capabilities.max_texture_size_get()
     tile_limit = min(_TILE_SIDE, texture_limit)
     groups = [group for group in entry['groups'] if len(group['records'])]
+    large_render = entry['edges'] > preview.MAX_GROUP_EDGES
+    streamed_groups = {id(group) for group in groups if large_render
+                       and not group['style']['needs_chain'] and not group['style']['maps']}
+    stroke_samplers = (('edgeData', 'texture'), ('extraNormals', 'normal_texture'),
+                       ('styleData', 'style_texture'), ('curveData', 'curve_texture'),
+                       ('chainData', 'chain_texture'), ('colorImage', 'color_texture'),
+                       ('sizeImage', 'size_texture'), ('coordinateData', 'coordinate_texture'))
     # Keep unshifted centerline depth samples inside the tile after an offset,
     # extension, or round cap moves the fragment away from its source.
     reach = max((group['width'] * group['style']['params'][3, 2] / 2
@@ -243,6 +253,8 @@ def draw(scene, depsgraph, entry, frame, bounds, *, world=None, shift_x=None):
         preview._resources()
         shader = preview._shader
         for group in groups:
+            if id(group) in streamed_groups:
+                continue
             preview._texture(group)
             if group['style']['needs_chain']:
                 info = (width, height, group['width'], perspective)
@@ -309,6 +321,11 @@ def draw(scene, depsgraph, entry, frame, bounds, *, world=None, shift_x=None):
                     shader.uniform_sampler('objectDepth', texture)
                     last_object_depth = None
                     for group in groups:
+                        streaming = id(group) in streamed_groups
+                        if streaming:
+                            if test_break is not None and test_break():
+                                return None
+                            preview._texture(group)
                         if group.get('object_depth') is not None and group['object_depth'] is not last_object_depth:
                             object_depth = preview._object_depth(group, tile_view, size, _RENDER_AREA)
                             shader.bind()
@@ -331,16 +348,20 @@ def draw(scene, depsgraph, entry, frame, bounds, *, world=None, shift_x=None):
                                 visibility_data = gpu_chain.update_normal_directions(group,pv,info,eye,direction,texture,_RENDER_AREA)
                                 shader.bind()
                         shader.uniform_sampler('sceneDepth', group_depth)
-                        for name, key in (('edgeData', 'texture'), ('extraNormals', 'normal_texture'),
-                            ('styleData', 'style_texture'), ('curveData', 'curve_texture'),
-                            ('chainData', 'chain_texture'), ('colorImage', 'color_texture'),
-                            ('sizeImage', 'size_texture'), ('coordinateData', 'coordinate_texture')):
+                        for name, key in stroke_samplers:
                             shader.uniform_sampler(name, group[key])
                         shader.uniform_sampler('visibilityData', visibility_data)
                         shader.uniform_sampler('jointData', group.get('joint_texture',group['chain_texture']))
-                        shader.uniform_float('directionInfo', (*direction[:3],float(use_visibility)))
+                        wave_mask = group.get('chain_views',{}).get(_RENDER_AREA,{}).get('wave_mask')
+                        shader.uniform_sampler('waveMask', wave_mask if wave_mask is not None else group['chain_texture'])
+                        shader.uniform_float('directionInfo', (*direction[:3],2. if wave_mask is not None else float(use_visibility)))
                         shader.uniform_float('viewportInfo', info)
                         preview._batch.draw_instanced(shader, instance_count=len(group['records'])*(2 if group['style']['params'][17,3] else 1))
+                        if streaming:
+                            # The next draw binds its own textures. Keep only
+                            # the current group's uploads resident for this tile.
+                            for _, key in stroke_samplers:
+                                del group[key]
                     w, h = right-x, top-y
                     buffer = framebuffer.read_color(x-left, y-bottom, w, h, 4, 0, 'FLOAT')
                     buffer.dimensions = w * h * 4
@@ -362,19 +383,15 @@ def draw(scene, depsgraph, entry, frame, bounds, *, world=None, shift_x=None):
         gpu.state.scissor_set(*scissor)
 
 
-class REA_GPU_LINE_ENGINE(bpy.types.RenderEngine):
-    bl_idname = 'REA_PENCIL_GPU'
-    bl_label = 'REA Pencil GPU Lines (Experimental)'
-    bl_use_gpu_context = True
-    bl_use_preview = False
-    # Blender restores the full canvas for an uncropped border only on the
-    # standard pipeline. The render-init scope still disables compositing.
-    bl_use_postprocess = True
-    bl_use_custom_freestyle = True
-
+class _LineEngine:
     def render(self, depsgraph):
         global LAST_RESULT, _captured_pixels
         from . import gpu_preview
+        cpu = self.bl_idname == 'REA_PENCIL_CPU'
+        if cpu:
+            from . import cpu_render
+        snapshot = cpu_render.snapshot if cpu else gpu_preview.snapshot
+        raster = cpu_render.draw if cpu else draw
         start = time.perf_counter()
         scene = depsgraph.scene_eval
         LAST_RESULT = {'status': 'running', 'depsgraph_mode': depsgraph.mode}
@@ -398,7 +415,7 @@ class REA_GPU_LINE_ENGINE(bpy.types.RenderEngine):
                 raise ValueError('Create a REA Pencil Line tree first')
             frame, bounds = _render_window(scene.render)
             self.update_stats('REA Pencil', 'Preparing render geometry')
-            entry = gpu_preview.snapshot(scene, depsgraph)
+            entry = snapshot(scene, depsgraph)
             prepared = time.perf_counter()
             if self.test_break():
                 LAST_RESULT = {'status': 'cancelled'}
@@ -412,6 +429,7 @@ class REA_GPU_LINE_ENGINE(bpy.types.RenderEngine):
             tiles = 0
             alpha_mass = 0.
             draw_seconds = 0.
+            cpu_prepare_seconds = cpu_raster_seconds = 0.
             for view in views:
                 world, shift_x = None, None
                 if stereo:
@@ -419,7 +437,7 @@ class REA_GPU_LINE_ENGINE(bpy.types.RenderEngine):
                     world = self.camera_model_matrix(camera)
                     shift_x = self.camera_shift_x(camera)
                 draw_start = time.perf_counter()
-                rgba = draw(scene, depsgraph, entry, frame, bounds, world=world, shift_x=shift_x)
+                rgba = raster(scene, depsgraph, entry, frame, bounds, world=world, shift_x=shift_x)
                 draw_seconds += time.perf_counter()-draw_start
                 if rgba is None or self.test_break():
                     LAST_RESULT = {'status': 'cancelled'}
@@ -429,6 +447,9 @@ class REA_GPU_LINE_ENGINE(bpy.types.RenderEngine):
                 self.end_result(result)
                 result = None
                 tiles += entry['render_tiles']
+                if cpu:
+                    cpu_prepare_seconds += entry['cpu_prepare_seconds']
+                    cpu_raster_seconds += entry['cpu_raster_seconds']
                 alpha_mass += float(rgba[:,:,3].sum())
                 if _capture_requested:
                     if rgba.shape[:2] != output_size:
@@ -439,13 +460,15 @@ class REA_GPU_LINE_ENGINE(bpy.types.RenderEngine):
                         captures[view] = rgba
             if _capture_requested:
                 _captured_pixels = captures if stereo else captures['']
-            LAST_RESULT = {'status': 'ok', 'depsgraph_mode': depsgraph.mode,
-                'prepare_seconds': prepared-start, 'GPU_draw_readback_seconds': draw_seconds,
+            LAST_RESULT = {'status': 'ok', 'depsgraph_mode': depsgraph.mode, 'line_backend': 'CPU' if cpu else 'GPU',
+                'prepare_seconds': prepared-start + cpu_prepare_seconds,
                 'engine_seconds': time.perf_counter()-start, 'edges': entry['edges'],
-                'depth_triangles': len(entry['depth']['triangles']),
+                'depth_triangles': entry['depth_triangles'] if cpu else len(entry['depth']['triangles']),
                 'alpha_mass': alpha_mass, 'size': list(output_size),
                 'render_window': list(bounds),
                 'render_tiles': tiles, 'gpu_texture_limit': entry['gpu_texture_limit']}
+            LAST_RESULT['CPU_raster_seconds' if cpu else 'GPU_draw_readback_seconds'] = (
+                cpu_raster_seconds if cpu else draw_seconds)
             if stereo:
                 LAST_RESULT['view_names'] = views
         except Exception as error:
@@ -457,8 +480,27 @@ class REA_GPU_LINE_ENGINE(bpy.types.RenderEngine):
             self.active_view_set(active_view)
 
 
+class REA_GPU_LINE_ENGINE(_LineEngine, bpy.types.RenderEngine):
+    bl_idname = 'REA_PENCIL_GPU'
+    bl_label = 'REA Pencil GPU Lines (Experimental)'
+    bl_use_gpu_context = True
+    bl_use_preview = False
+    bl_use_postprocess = True
+    bl_use_custom_freestyle = True
+
+
+class REA_CPU_LINE_ENGINE(_LineEngine, bpy.types.RenderEngine):
+    bl_idname = 'REA_PENCIL_CPU'
+    bl_label = 'REA Pencil CPU Lines (Experimental)'
+    bl_use_gpu_context = False
+    bl_use_preview = False
+    bl_use_postprocess = True
+    bl_use_custom_freestyle = True
+
+
 def register():
     bpy.utils.register_class(REA_GPU_LINE_ENGINE)
+    bpy.utils.register_class(REA_CPU_LINE_ENGINE)
     for handlers, callback in ((bpy.app.handlers.render_init, _render_init),
                               (bpy.app.handlers.render_complete, _render_end),
                               (bpy.app.handlers.render_cancel, _render_end),
@@ -476,3 +518,4 @@ def unregister():
         if callback in handlers:
             handlers.remove(callback)
     bpy.utils.unregister_class(REA_GPU_LINE_ENGINE)
+    bpy.utils.unregister_class(REA_CPU_LINE_ENGINE)

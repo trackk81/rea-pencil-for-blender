@@ -462,6 +462,31 @@ finally:
     gpu_render._TILE_SIDE = tile_side
 checks['distortion_hidden_phase_is_identical_across_render_tiles']=True
 
+from lea_line import gpu_chain
+extra_mark = marked_strip('Wave mask regression', .8, 1)
+extra_mark.scale.x = 6
+extra_cover = quad('Second wave mask occluder', -.36, 1, width=.12)
+mask_limit = gpu_chain.MAX_WAVE_MASK_BYTES
+with ui.suspend_sync():
+    n.objects.add().object = extra_mark
+try:
+    for hidden in (False,True):
+        with ui.suspend_sync():
+            n.visible, n.hidden = not hidden, hidden
+        accelerated = capture()
+        gpu_chain.MAX_WAVE_MASK_BYTES = 0
+        try:
+            assert np.array_equal(accelerated,capture())
+        finally:
+            gpu_chain.MAX_WAVE_MASK_BYTES = mask_limit
+finally:
+    with ui.suspend_sync():
+        n.objects.remove(len(n.objects)-1)
+        n.visible, n.hidden = False, True
+    bpy.data.objects.remove(extra_mark,do_unlink=True)
+    bpy.data.objects.remove(extra_cover,do_unlink=True)
+checks['wave_visibility_acceleration_preserves_visible_and_hidden_pixels']=True
+
 visible_cap = visible_wave[251:262, 442:444, 3]
 hidden_cap = hidden_wave[251:262, 414:416, 3]
 for cap in (visible_cap, hidden_cap):

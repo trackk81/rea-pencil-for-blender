@@ -10,6 +10,7 @@ import bpy
 from bpy.props import EnumProperty,FloatProperty,IntProperty,BoolProperty,StringProperty
 
 TAG='rea_stamp_mask'
+PREVIEW_PATTERN = '_rea_stamp_preview_pattern'
 FIELDS=('brush_type','brush_map_on','brush_map_opacity','stretch','angle','groove','groove_number',
         'stamp_size','stamp_size_random','stamp_antialiasing','horizontal_space','horizontal_space_random',
         'vertical_space','vertical_space_random','stamp_reduction_start','stamp_reduction_end',
@@ -49,9 +50,35 @@ def spec(brush):
     result['seed']=getattr(brush,'random_seed',0)
     return result
 
+def preview_pattern(node, width):
+    """Return the preset's stamp spacing and jitter in projected pixels."""
+    pattern = node.image.get(PREVIEW_PATTERN) if node else None
+    if pattern is None:
+        return 1., 0.
+    try:
+        pitch, jitter = pattern
+        if 0. < pitch <= 1. and 0. <= jitter <= .5:
+            return max(1., pitch * width), jitter * width
+    except (TypeError, ValueError):
+        pass
+    return 1., 0.
+
+
+def jitter_stamps(graph, geometry, jitter):
+    from . import preview_stroke
+    random = graph.nodes.new('FunctionNodeRandomValue')
+    random.name = 'Dry Media Stamp Jitter'
+    random.data_type = 'FLOAT_VECTOR'
+    random.inputs[0].default_value = (-jitter, -jitter, 0.)
+    random.inputs[1].default_value = (jitter, jitter, 0.)
+    random.inputs['Seed'].default_value = 1219
+    index = graph.nodes.new('GeometryNodeInputIndex')
+    graph.links.new(index.outputs[0], random.inputs['ID'])
+    return preview_stroke._position(graph, 'Vary Dry Media Stamp Positions', geometry, offset=random.outputs[0])
+
+
 def mask(brush,width):
     if threading.current_thread() is not threading.main_thread():raise RuntimeError('Stamp images require main-thread preparation; use F12')
-    from . import texture_maps as tex
     values=spec(brush);node=detail_map(brush,'brush')
     source=(node.image.as_pointer(),node.image.name_full,tuple(node.image.size),_revisions.get(node.image.as_pointer(),0)) if node else None
     mapping=(node.wrap_mode_u,node.wrap_mode_v,node.filter_mode,tuple(node.tiling),tuple(node.offset),node.rotation) if node else None
@@ -62,6 +89,19 @@ def mask(brush,width):
     except ReferenceError:image=None
     if image and bpy.data.images.get(image.name)==image:
         _images.move_to_end(key);return image
+    alpha = mask_pixels(brush, width, node)
+    size = alpha.shape[0]
+    data=np.ones((size,size,4),np.float32);data[:,:,3]=alpha
+    image=bpy.data.images.new('.rea stamp mask',width=size,height=size,float_buffer=True);image[TAG]=1
+    image.pixels.foreach_set(data.ravel());image.update();image.pack();_images[key]=image
+    while len(_images)>16:_images.popitem(last=False)
+    prune();return image
+
+
+def mask_pixels(brush, width, node=None):
+    """Sample the stamp tip without creating an image datablock."""
+    from . import texture_maps as tex
+    values = spec(brush)
     buffer=tex.pixels(node.image) if node else None
     size=128;yy,xx=np.mgrid[:size,:size];x=(xx+.5)/size*2-1;y=(yy+.5)/size*2-1
     c,s=math.cos(brush.angle),math.sin(brush.angle);u=c*x+s*y;v=-s*x+c*y
@@ -92,11 +132,7 @@ def mask(brush,width):
         uv=np.column_stack(((x.ravel()+1)/2,(y.ravel()+1)/2))
         rgb=tex.sample(node,uv,buffer)[:,:3].mean(1).reshape(size,size)
         alpha*=1-brush.brush_map_opacity+brush.brush_map_opacity*rgb
-    data=np.ones((size,size,4),np.float32);data[:,:,3]=np.clip(alpha,0,1)
-    image=bpy.data.images.new('.rea stamp mask',width=size,height=size,float_buffer=True);image[TAG]=1
-    image.pixels.foreach_set(data.ravel());image.update();image.pack();_images[key]=image
-    while len(_images)>16:_images.popitem(last=False)
-    prune();return image
+    return np.clip(alpha, 0, 1)
 
 def prune():
     for image in list(bpy.data.images):

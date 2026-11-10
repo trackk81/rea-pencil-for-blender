@@ -36,25 +36,29 @@ vec4 markedDepthPlanes(mat4 projection,vec2 size,vec4 p,vec4 q,vec3 span,vec4 fi
     if (a.z*b.z>=0.0) return vec4(0);
     return a.z<0.0?vec4(a.xy,b.xy):vec4(b.xy,a.xy);
 }
-float markedDepthTap(ivec2 pixel,vec2 center,vec2 delta,float depth,vec4 planes) {
+float markedDepthTap(ivec2 pixel,vec2 center,vec2 delta,float depth,vec4 planes,sampler2D ownerDepth,bool checkOwner) {
     pixel=clamp(pixel,ivec2(0),textureSize(sceneDepth,0)-1);
     vec2 offset=vec2(pixel)+.5-center;
     vec2 gradient=delta.x*offset.y-delta.y*offset.x<0.0?planes.xy:planes.zw;
     float observed=texelFetch(sceneDepth,pixel,0).r;
+    if (checkOwner && abs(observed-texelFetch(ownerDepth,pixel,0).r)>1e-7) return observed;
     float expected=depth+dot(offset,gradient);
     // Only reproject a texel that matches the incident face. A nearer
     // surface whose depth differs from that plane still occludes the mark.
     return abs(observed-expected)<=.000002?depth:observed;
 }
-float markedCenterDepth(vec2 center,vec2 delta,float depth,vec4 planes) {
+float markedCenterDepth(vec2 center,vec2 delta,float depth,vec4 planes,sampler2D ownerDepth,bool checkOwner) {
     if (all(equal(planes,vec4(0)))) return centerDepth(center);
     vec2 p=center-.5, f=fract(p);
     ivec2 a=ivec2(floor(p));
-    float d00=markedDepthTap(a,center,delta,depth,planes);
-    float d10=markedDepthTap(a+ivec2(1,0),center,delta,depth,planes);
-    float d01=markedDepthTap(a+ivec2(0,1),center,delta,depth,planes);
-    float d11=markedDepthTap(a+ivec2(1,1),center,delta,depth,planes);
+    float d00=markedDepthTap(a,center,delta,depth,planes,ownerDepth,checkOwner);
+    float d10=markedDepthTap(a+ivec2(1,0),center,delta,depth,planes,ownerDepth,checkOwner);
+    float d01=markedDepthTap(a+ivec2(0,1),center,delta,depth,planes,ownerDepth,checkOwner);
+    float d11=markedDepthTap(a+ivec2(1,1),center,delta,depth,planes,ownerDepth,checkOwner);
     return mix(mix(d00,d10,f.x),mix(d01,d11,f.x),f.y);
+}
+float markedCenterDepth(vec2 center,vec2 delta,float depth,vec4 planes) {
+    return markedCenterDepth(center,delta,depth,planes,sceneDepth,false);
 }
 '''
 
@@ -80,7 +84,7 @@ bool spanSample(vec4 points,vec2 depths,float t,bool hidden,vec4 planes) {
 bool spanSample(vec4 points,vec2 depths,float t,bool hidden) {
     return spanSample(points,depths,t,hidden,vec4(0));
 }
-float spanLength(vec4 points,vec2 depths,float lengthValue,float start,float direction,float limit,bool hidden,vec4 planes,bool outsideVisible) {
+float spanLengthFrom(vec4 points,vec2 depths,float lengthValue,float start,float direction,float limit,bool hidden,vec4 planes,bool outsideVisible,float firstStep) {
     float available=direction>0.0?lengthValue-start:start;
     float stop=min(available,limit);
     if (!spanSample(points,depths,start/lengthValue,hidden,planes,outsideVisible)) return 0.0;
@@ -104,7 +108,7 @@ float spanLength(vec4 points,vec2 depths,float lengthValue,float start,float dir
     }
     // Step at pixel intervals, then refine the first transition. All queries
     // stop once enough length has been found to satisfy the threshold.
-    for (float stepIndex=1.0;stepIndex<last-first+1.0;stepIndex+=1.0) {
+    for (float stepIndex=firstStep;stepIndex<last-first+1.0;stepIndex+=1.0) {
         float offset=first+stepIndex;
         float hi=min(offset,last);
         if (!spanSample(points,depths,(start+direction*hi)/lengthValue,hidden,planes,outsideVisible)) {
@@ -120,6 +124,9 @@ float spanLength(vec4 points,vec2 depths,float lengthValue,float start,float dir
         }
     }
     return stop;
+}
+float spanLength(vec4 points,vec2 depths,float lengthValue,float start,float direction,float limit,bool hidden,vec4 planes,bool outsideVisible) {
+    return spanLengthFrom(points,depths,lengthValue,start,direction,limit,hidden,planes,outsideVisible,1.0);
 }
 float spanLength(vec4 points,vec2 depths,float lengthValue,float start,float direction,float limit,bool hidden,vec4 planes) {
     return spanLength(points,depths,lengthValue,start,direction,limit,hidden,planes,false);
@@ -160,9 +167,15 @@ def merge_members(collection):
     return members
 
 
-def snapshot(depsgraph, members=None):
+def instance_key(obj, matrix):
+    return obj.original.as_pointer(), tuple(tuple(row) for row in matrix)
+
+
+def snapshot(depsgraph, members=None, *, index_ranges=False):
     vertices=[];triangles=[];offset=0
     parts = {}
+    ranges = {}
+    index_offset = 0
     for instance in depsgraph.object_instances:
         obj=instance.object
         if obj.type!='MESH' or not instance.show_self:continue
@@ -171,7 +184,11 @@ def snapshot(depsgraph, members=None):
         try:
             v=np.empty((len(mesh.vertices),3),np.float32);mesh.vertices.foreach_get('co',v.ravel())
             t=mesh_triangles(mesh)
-            m=np.asarray(instance.matrix_world,np.float32)
+            matrix = instance.matrix_world
+            if index_ranges:
+                ranges.setdefault(instance_key(obj, matrix), (index_offset, t.size))
+                index_offset += t.size
+            m=np.asarray(matrix,np.float32)
             world = v@m[:3,:3].T+m[:3,3]
             vertices.append(world);triangles.append(t+offset);offset+=len(v)
             # Group membership belongs to the source object. Every evaluated
@@ -188,15 +205,17 @@ def snapshot(depsgraph, members=None):
                                'triangles': np.concatenate([array + start for array, start in zip(indices, offsets)])}
     return {'vertices':np.concatenate(vertices) if vertices else np.zeros((0,3),np.float32),
             'triangles':np.concatenate(triangles) if triangles else np.zeros((0,3),np.int32),
-            'areas':{}, 'merge_depths': merge_depths}
+            'areas':{}, 'merge_depths': merge_depths, 'object_ranges': ranges}
 
 
 def draw(data,view,size,area_id):
     import gpu
     from gpu_extras.batch import batch_for_shader
-    if 'shader' not in data:
-        data['shader']=gpu.shader.from_builtin('UNIFORM_COLOR')
-        data['batch']=batch_for_shader(data['shader'],'TRIS',{'pos':data['vertices']},indices=data['triangles']) if len(data['triangles']) else None
+    source = data.get('source', data)
+    if 'shader' not in source:
+        source['shader']=gpu.shader.from_builtin('UNIFORM_COLOR')
+    if 'batch' not in source:
+        source['batch']=batch_for_shader(source['shader'],'TRIS',{'pos':source['vertices']},indices=source['triangles']) if len(source['triangles']) else None
     area=data['areas'].get(area_id)
     if area is None or area['size']!=size:
         tex=gpu.types.GPUTexture(size,format='DEPTH_COMPONENT32F')
@@ -207,9 +226,16 @@ def draw(data,view,size,area_id):
             gpu.state.viewport_set(0,0,*size);gpu.state.scissor_set(0,0,*size)
             gpu.state.depth_test_set('LESS_EQUAL');gpu.state.depth_mask_set(True);gpu.state.blend_set('NONE')
             area['framebuffer'].clear(depth=1.)
-            if data['batch']:
+            if source['batch']:
                 with gpu.matrix.push_pop():
                     gpu.matrix.load_matrix(view.view_matrix);gpu.matrix.load_projection_matrix(view.window_matrix)
-                    data['shader'].bind();data['shader'].uniform_float('color',(1,1,1,1));data['batch'].draw(data['shader'])
+                    shader = source['shader']
+                    shader.bind();shader.uniform_float('color',(1,1,1,1))
+                    if 'index_range' in data:
+                        start, count = data['index_range']
+                        if count:
+                            source['batch'].draw_range(shader, elem_start=start, elem_count=count)
+                    else:
+                        source['batch'].draw(shader)
     finally:gpu.state.viewport_set(*viewport);gpu.state.scissor_set(*scissor)
     return area['texture']

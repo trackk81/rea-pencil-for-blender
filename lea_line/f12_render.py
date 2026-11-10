@@ -1,4 +1,4 @@
-"""F12 dispatch through the same GPU composite path as the REA Render button.
+"""F12 dispatch through the same composite path as the REA Render button.
 
 The existing prepared-render add-on keymap dispatches here; no duplicate binding
 is added. Native/user keymaps are never edited.
@@ -19,24 +19,29 @@ def _native_render(scene):
 
 class LEA_OT_render_f12(bpy.types.Operator):
     bl_idname = 'lea_line.render_f12'
-    bl_label = 'Render Image with REA GPU Lines'
-    bl_description = 'REA 그래프가 있으면 장면과 GPU 선을 합성하고, 없으면 Blender 기본 렌더를 실행합니다'
+    bl_label = 'Render Image with REA Lines'
+    bl_description = 'REA 그래프가 있으면 장면과 REA 선을 합성하고, 없으면 Blender 기본 렌더를 실행합니다'
     bl_options = {'INTERNAL'}
 
     def execute(self, context):
+        from .gpu_render import LINE_ENGINES
         global LAST_INVOCATION
         scene = context.scene
         settings = getattr(scene, 'lea_line', None)
-        use_gpu = bool(settings and settings.tree and settings.f12_gpu_lines)
-        LAST_INVOCATION = {'route': 'GPU' if use_gpu else 'BLENDER',
+        use_rea = bool(settings and settings.tree and settings.f12_gpu_lines)
+        engine = scene.render.engine
+        line_only = engine in LINE_ENGINES
+        route = 'BLENDER'
+        if use_rea:
+            route = engine.removeprefix('REA_PENCIL_') if line_only else settings.final_line_backend
+        LAST_INVOCATION = {'route': route,
                            'scene': scene.name, 'status': 'running', 'start': time.perf_counter()}
         if bpy.app.is_job_running('RENDER'):
             LAST_INVOCATION['status'] = 'busy'
             self.report({'WARNING'}, '이미 렌더가 진행 중입니다')
             return {'CANCELLED'}
         try:
-            if use_gpu:
-                line_only = scene.render.engine == 'REA_PENCIL_GPU'
+            if use_rea:
                 LAST_INVOCATION['output'] = 'LINES' if line_only else 'COMPOSITE'
                 result = (bpy.ops.lea_line.render_lines('EXEC_DEFAULT') if line_only
                           else bpy.ops.lea_line.render('EXEC_DEFAULT'))

@@ -51,13 +51,18 @@ def dimensions(scene):
     entry=_entries.get(scene.as_pointer())
     return entry['dimensions'] if _active==scene.as_pointer() and entry else None
 
+def pixel_scale():
+    """Pencil+ scales absolute free-view widths by the system UI ratio."""
+    preferences = bpy.context.preferences
+    return preferences.system.ui_scale / max(preferences.view.ui_scale, 1e-6)
+
 def context(function):
     @functools.wraps(function)
     def run(scene,*args,**kwargs):
         global _active
         previous=_active
         material_render=kwargs.get('material_render',args[0] if args else False)
-        if not material_render and scene.as_pointer() in _entries:_active=scene.as_pointer()
+        _active=None if material_render else scene.as_pointer()
         try:return function(scene,*args,**kwargs)
         finally:_active=previous
     return run
@@ -69,6 +74,94 @@ def stop(scene):
         cam=entry['camera'];data=cam.data
         if cam.get(TAG):bpy.data.objects.remove(cam,do_unlink=True)
         if data.users==0 and data.get(TAG):bpy.data.cameras.remove(data)
+
+def stop_automatic(scene):
+    entry = _entries.get(scene.as_pointer())
+    if entry and entry.get('automatic'):
+        stop(scene)
+
+
+def available_view(scene):
+    """Find a free View3D in a window that is displaying this scene."""
+    context = bpy.context
+    windows = context.window_manager.windows if context.window_manager else ()
+    candidates = []
+    for window in windows:
+        if window.scene != scene or not window.screen:
+            continue
+        for area in window.screen.areas:
+            if area.type != 'VIEW_3D' or area.spaces.active.region_3d.view_perspective == 'CAMERA':
+                continue
+            region = next((r for r in area.regions if r.type == 'WINDOW' and r.width > 0 and r.height > 0), None)
+            if region:
+                priority = (area == context.area, window == context.window, region.width * region.height)
+                candidates.append((priority, area, region))
+    if candidates:
+        _, area, region = max(candidates, key=lambda candidate: candidate[0])
+        return area, region
+    return None
+
+
+def _start(scene, area, region, *, automatic=False):
+    stop(scene)
+    data = bpy.data.cameras.new('.rea free view camera')
+    data[TAG] = True
+    cam = bpy.data.objects.new('.rea free view camera', data)
+    cam[TAG] = True
+    cam['rea_pencil_preview'] = True
+    cam.hide_render = True
+    cam.hide_viewport = True
+    scene.collection.objects.link(cam)
+    _entries[scene.as_pointer()] = {
+        'camera': cam, 'area': area.as_pointer(), 'automatic': automatic,
+        'dimensions': (region.width, region.height),
+    }
+    try:
+        update(scene, area, region)
+    except Exception:
+        stop(scene)
+        raise
+    if not bpy.app.timers.is_registered(tick):
+        bpy.app.timers.register(tick, first_interval=1/30)
+
+
+def unsupported_reason(specifications):
+    from . import texture_maps, material_scope, routing
+    for node, common in specifications:
+        if material_scope.active(node) or node.use_material_functions:
+            return 'Native 자유 시점은 재질 대상과 Line Functions를 지원하지 않습니다.'
+        for visibility in ('VISIBLE', 'HIDDEN'):
+            for job in routing.jobs(node, common, visibility):
+                if texture_maps.maps(job['brush']):
+                    return 'Native 자유 시점은 브러시 텍스처 맵을 지원하지 않습니다.'
+    return None
+
+
+def wants_automatic(scene):
+    settings = scene.lea_line
+    return settings.preview_enabled and not bpy.app.background and (
+        scene.camera is None or (settings.preview_compute == 'NATIVE' and settings.native_follow_viewport))
+
+
+def sync_automatic(scene, specifications):
+    entry = _entries.get(scene.as_pointer())
+    if entry and not entry.get('automatic'):
+        return None
+    if not wants_automatic(scene):
+        stop_automatic(scene)
+        return None
+    view = available_view(scene)
+    if view is None:
+        stop_automatic(scene)
+        return None if scene.camera else '일반 미리보기를 시작할 자유 시점의 3D 뷰를 열어 주세요.'
+    reason = unsupported_reason(specifications)
+    if reason:
+        stop_automatic(scene)
+        return reason
+    if not entry:
+        _start(scene, *view, automatic=True)
+    return None
+
 
 def update(scene,area,region):
     entry=_entries[scene.as_pointer()];space=area.spaces.active;view=space.region_3d
@@ -110,10 +203,16 @@ def tick():
                 if data.users==0 and data.get(TAG):bpy.data.cameras.remove(data)
             except ReferenceError:pass
             continue
-        area=next((a for w in bpy.context.window_manager.windows for a in w.screen.areas
+        area=next((a for w in bpy.context.window_manager.windows if w.scene==scene for a in w.screen.areas
                    if a.as_pointer()==entry['area'] and a.type=='VIEW_3D'),None)
-        if area is None or not scene.lea_line.preview_enabled:
+        if not scene.lea_line.preview_enabled:
             stop(scene);continue
+        if area is None or (entry.get('automatic') and not wants_automatic(scene)):
+            stop(scene)
+            if entry.get('automatic'):
+                from .ui import _sync_if_enabled
+                _sync_if_enabled(scene.lea_line)
+            continue
         region=next((r for r in area.regions if r.type=='WINDOW'),None)
         from . import gpu_preview
         if gpu_preview.active(scene):
@@ -154,9 +253,14 @@ class LEA_OT_follow_view(bpy.types.Operator):
     def execute(self,context):
         scene=context.scene
         if not self.enabled:
+            if scene.camera is None:
+                return {'CANCELLED'}
+            scene.lea_line.native_follow_viewport = False
             stop(scene)
-            from . import viewport
-            viewport.sync_preview(scene);return {'FINISHED'}
+            if scene.lea_line.preview_enabled:
+                from . import viewport
+                scene.lea_line.last_message = '\n'.join(viewport.sync_preview(scene))
+            return {'FINISHED'}
         if bpy.app.is_job_running('RENDER') or not scene.lea_line.tree:return {'CANCELLED'}
         areas=[context.area] if context.area and context.area.type=='VIEW_3D' else [a for a in context.screen.areas if a.type=='VIEW_3D']
         if len(areas)!=1:
@@ -164,24 +268,16 @@ class LEA_OT_follow_view(bpy.types.Operator):
         area=areas[0];region=next(r for r in area.regions if r.type=='WINDOW')
         if area.spaces.active.region_3d.view_perspective=='CAMERA':
             self.report({'ERROR'},'Leave camera view with Numpad 0, then follow the viewport');return {'CANCELLED'}
-        from . import backend,texture_maps,material_scope,routing
-        for node,common in backend._specifications(scene.lea_line.tree):
-            if material_scope.active(node) or node.use_material_functions:
-                self.report({'ERROR'},'Free View material-face evaluation is not yet verified');return {'CANCELLED'}
-            for visibility in ('VISIBLE','HIDDEN'):
-                for job in routing.jobs(node,common,visibility):
-                    if texture_maps.maps(job['brush']):
-                        self.report({'ERROR'},'Free View texture mapping is not yet verified');return {'CANCELLED'}
-        stop(scene)
-        data=bpy.data.cameras.new('.rea free view camera');data[TAG]=True
-        cam=bpy.data.objects.new('.rea free view camera',data);cam[TAG]=True;cam['rea_pencil_preview']=True
-        scene.collection.objects.link(cam);cam.hide_render=True;cam.hide_viewport=True
-        _entries[scene.as_pointer()]={'camera':cam,'area':area.as_pointer(),'dimensions':(region.width,region.height)}
+        from . import backend
+        reason = unsupported_reason(backend._specifications(scene.lea_line.tree))
+        if reason:
+            self.report({'ERROR'}, reason)
+            return {'CANCELLED'}
+        scene.lea_line.native_follow_viewport = True
+        _start(scene, area, region)
         if not scene.lea_line.preview_enabled:scene.lea_line.preview_enabled=True
-        update(scene,area,region)
         from . import viewport,gpu_preview
         if not gpu_preview.active(scene):viewport.sync_preview(scene)
-        if not bpy.app.timers.is_registered(tick):bpy.app.timers.register(tick,first_interval=1/30)
         return {'FINISHED'}
 
 @persistent

@@ -107,7 +107,7 @@ def upgrade_tree(tree):
     return added
 
 
-def _sync_if_enabled(owner, context=None):
+def _sync_if_enabled(owner, context=None, *, wave_detail=None):
     # RNA rebinding may notify existing nodes during restricted addon enable.
     # Deferred bootstrap/load handlers will synchronize after data is available.
     if not hasattr(bpy.data, 'scenes'):
@@ -133,8 +133,11 @@ def _sync_if_enabled(owner, context=None):
                 try:
                     warnings = backend.sync_scene(scene, settings.tree) if settings.auto_sync else []
                     if settings.preview_enabled:
-                        from . import viewport
-                        warnings = list(warnings) + viewport.sync_preview(scene)
+                        from . import gpu_preview, viewport
+                        if wave_detail is not None and gpu_preview.refresh_wave(scene, wave_detail):
+                            warnings = list(warnings) + ['GPU 웨이브 설정 갱신']
+                        else:
+                            warnings = list(warnings) + viewport.sync_preview(scene)
                     settings.last_message = "\n".join(warnings) if warnings else "rea pencil for blender settings synchronized"
                 except Exception as exc:
                     # Node graph editing may temporarily leave an incomplete graph.
@@ -163,7 +166,7 @@ def _preview_changed(settings, context):
         with suspend_sync():
             if settings.preview_enabled:
                 warnings = viewport.sync_preview(scene)
-                settings.last_message = "\n".join(warnings) if warnings else "Camera-based live preview synchronized"
+                settings.last_message = "\n".join(warnings) if warnings else "Live preview synchronized"
             else:
                 viewport.clear_preview(scene)
                 settings.last_message = "Live preview disabled"
@@ -174,7 +177,16 @@ def _preview_changed(settings, context):
 
 
 class LEALineSettings(bpy.types.PropertyGroup):
-    f12_gpu_lines: BoolProperty(name='F12 GPU Lines', description='F12로 REA GPU 선과 장면을 합성합니다. REA 그래프가 없는 장면은 기본 렌더를 사용합니다', default=True)
+    f12_gpu_lines: BoolProperty(name='F12 REA 선 렌더', description='F12로 선택한 CPU 또는 GPU 선 패스와 장면을 합성합니다. REA 그래프가 없는 장면은 기본 렌더를 사용합니다', default=True)
+    cycles_cpu_render: BoolProperty(
+        name='Cycles 장면·합성 CPU',
+        description='REA Render와 F12에서 Cycles 장면과 합성을 CPU로 처리합니다',
+        default=False)
+    final_line_backend: EnumProperty(
+        name='최종 선 계산',
+        items=[('GPU', 'GPU', 'GPU 최종 선 렌더'),
+               ('CPU', 'CPU (시험)', '보이는 외곽선·열린 모서리·각도선·Selected Edges의 실선과 질감을 CPU로 렌더')],
+        default='GPU')
     fast_line_art: BoolProperty(name="Line Art Render (Experimental)", description="Alternative rendering for intersections and potential speed gains; different strokes, limited brush support; F12 stays normal", default=False)
     stroke_width_profile: EnumProperty(
         name="Stroke Coverage",
@@ -189,8 +201,11 @@ class LEALineSettings(bpy.types.PropertyGroup):
     backend: EnumProperty(name="Backend", items=[("FREESTYLE", "Blender Freestyle", "Native Blender Freestyle line renderer")], default="FREESTYLE")
     width_mode: EnumProperty(name="Width Mode", description="Use fixed pixel widths or scale widths with render height", items=[("ABSOLUTE", "Absolute Pixels", "Keep line widths fixed in render pixels"), ("RELATIVE", "Relative to Height", "Scale pixel widths by render height divided by reference height")], default="ABSOLUTE", update=_sync_if_enabled)
     reference_height: IntProperty(name="Reference Height", description="Render height at which relative line widths equal their brush thickness", min=1, default=480, update=_sync_if_enabled)
-    preview_enabled: BoolProperty(name="Enable Live Preview", description="Show camera-based Line Art with live stroke curves and pixel effects; final Freestyle lines may differ", default=False, update=_preview_changed)
-    preview_compute: EnumProperty(name="뷰포트 계산", description="Solid·재질·Rendered(EEVEE/Cycles)에서 곡선·점선·맵·숨은 선을 GPU로 계산합니다. Solid의 X-Ray는 끄세요. 메시 준비는 메인 스레드에서 수행하며 Native와 선 연결·AA 차이가 있습니다", items=[('NATIVE','Native Line Art','기존 Line Art 계산'),('GPU','GPU 미리보기 (시험)','정적 메시 캐시와 GPU 셰이더 사용; 미지원 설정은 Native로 처리')], default='GPU', update=_preview_changed)
+    preview_enabled: BoolProperty(name="Enable Live Preview", description="Show live lines in the 3D viewport, including scenes without an active camera", default=False, update=_preview_changed)
+    preview_compute: EnumProperty(name="뷰포트 계산", description="일반 미리보기와 REA의 GPU 미리보기 중 선택합니다", items=[('NATIVE','일반 미리보기 (Native Line Art)','현재 3D 뷰에서 Blender Line Art로 선을 계산합니다'),('GPU','GPU 미리보기 (시험)','정적 메시 캐시와 GPU 셰이더 사용; 미지원 설정은 일반 미리보기로 처리')], default='GPU', update=_preview_changed)
+    native_follow_viewport: BoolProperty(name="일반 미리보기에서 현재 시점 추적", default=True)
+    preview_cache_mib: IntProperty(name='GPU 미리보기 캐시 (MiB)', default=512, min=32, max=2048,
+        description='REA 선과 오브젝트 깊이 메시의 보관 한도. 화면을 그리는 임시 버퍼와 Blender 장면의 VRAM은 별도입니다')
     follow_refresh_mode: EnumProperty(name="시점 이동 중 갱신", description="큰 장면은 멈춘 뒤 갱신을 권장합니다. 이동 중 선을 잠시 숨기고 마지막 시점에서 계산합니다", items=[('SETTLED','멈춘 뒤 갱신','이동 중 선 계산을 미루고 시점이 0.2초 멈추면 갱신'),('LIVE','계속 갱신','시점이 바뀔 때마다 선 재계산; 큰 장면에서는 느릴 수 있습니다')], default='SETTLED')
     preview_simple_coverage: BoolProperty(name="Simple Coverage (Live)", description="Empirical coverage for uniform solids and directed open size curves (enable Line Direction). Closed variable chains and dashed/distance/alpha-curve styles retain geometric width; does not reproduce the original AA kernel or change final rendering", default=False, update=_preview_changed)
     preview_endpoint_coverage: BoolProperty(name="Endpoint Coverage (Experimental)", description="Conservative endpoint coverage for directed open SIZE curves with Round caps. Skips closed chains, other effects and existing Simple Coverage. Live preview only; original AA and final rendering may differ", default=False, update=_preview_changed)
@@ -615,7 +630,7 @@ def _draw_output_settings(context, layout, tree, runtime=False):
             layout.prop(settings, 'reference_height')
         return
     layout.prop(settings, 'auto_sync')
-    layout.label(text='Render: GPU lines + scene')
+    layout.label(text='Render: REA lines + scene')
     preview = layout.row(align=True)
     preview.use_property_split = False
     preview.prop(settings, 'preview_enabled', text='Live Preview')
@@ -628,6 +643,9 @@ def _draw_output_settings(context, layout, tree, runtime=False):
     row.operator('lea_line.apply', text='Apply', icon='FILE_REFRESH')
     row.operator('lea_line.render', text='Render', icon='RENDER_STILL')
     layout.prop(settings, 'f12_gpu_lines')
+    layout.prop(settings, 'final_line_backend')
+    if context.scene.render.engine == 'CYCLES':
+        layout.prop(settings, 'cycles_cpu_render')
 
 
 def _draw_runtime_panel(context, layout, tree):
@@ -1559,8 +1577,8 @@ class LEA_OT_add_line_set(bpy.types.Operator):
 
 class LEA_OT_render(bpy.types.Operator):
     bl_idname = "lea_line.render"
-    bl_label = "Render with GPU Lines"
-    bl_description = "장면과 독립 GPU 선을 합성합니다. 기존 Line Art 선은 중복되지 않도록 렌더 중만 제외합니다"
+    bl_label = "Render with REA Lines"
+    bl_description = "장면과 선택한 REA 선 패스를 합성합니다. 기존 Line Art 선은 중복되지 않도록 렌더 중만 제외합니다"
 
     def execute(self, context):
         from . import gpu_composite
@@ -1572,7 +1590,7 @@ class LEA_OT_render(bpy.types.Operator):
         if result['status'] == 'cancelled':
             return {'CANCELLED'}
         context.scene.lea_line.last_render_seconds = result['seconds']
-        context.scene.lea_line.last_message = f"GPU 선 합성 렌더: {result['seconds']:.3f}s"
+        context.scene.lea_line.last_message = f"{result['line_backend']} 선 합성 렌더: {result['seconds']:.3f}s"
         self.report({'INFO'}, context.scene.lea_line.last_message)
         if not bpy.app.background and context.preferences.view.render_display_type != 'NONE':
             bpy.ops.render.view_show('INVOKE_DEFAULT')
@@ -1582,7 +1600,7 @@ class LEA_OT_render(bpy.types.Operator):
 class LEA_OT_render_lines(bpy.types.Operator):
     bl_idname = 'lea_line.render_lines'
     bl_label = '라인만 렌더'
-    bl_description = '독립 GPU 엔진으로 메시 선만 투명 배경에 출력합니다. 미지원 브러시는 오류로 알리며 다른 렌더로 전환하지 않습니다'
+    bl_description = '선택한 REA 엔진으로 메시 선만 투명 배경에 출력합니다. 미지원 브러시는 오류로 표시합니다'
 
     def execute(self,context):
         from . import gpu_render
@@ -1592,7 +1610,7 @@ class LEA_OT_render_lines(bpy.types.Operator):
             self.report({'ERROR'},str(exc));return {'CANCELLED'}
         if result['status']=='cancelled':return {'CANCELLED'}
         context.scene.lea_line.last_render_seconds=result['seconds']
-        context.scene.lea_line.last_message=f"독립 GPU 라인 렌더: {result['seconds']:.3f}s · 투명 배경 · 저장 시 PNG RGBA"
+        context.scene.lea_line.last_message=f"독립 {result['line_backend']} 라인 렌더: {result['seconds']:.3f}s · 투명 배경 · 저장 시 PNG RGBA"
         if result['warnings']:self.report({'WARNING'},'; '.join(result['warnings']))
         self.report({'INFO'},context.scene.lea_line.last_message)
         if not bpy.app.background and context.preferences.view.render_display_type != 'NONE':

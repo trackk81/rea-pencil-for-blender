@@ -25,6 +25,11 @@ def _changed(owner, context):
     _sync_if_enabled(owner, context)
 
 
+def _wave_changed(owner, context):
+    from .ui import _sync_if_enabled
+    _sync_if_enabled(owner, context, wave_detail=owner)
+
+
 def _curve_enabled_changed(owner, context):
     from . import curves
     if owner.size_curve_enabled or owner.alpha_curve_enabled:
@@ -158,9 +163,9 @@ class LEABrushDetailNode(bpy.types.Node):
     offset_x: FloatProperty(name='X Offset', description='Horizontal image-space displacement in pixels', min=-1000, max=1000, default=0, subtype='PIXEL', update=_changed)
     offset_y: FloatProperty(name='Y Offset', description='Vertical image-space displacement in pixels; positive moves down', min=-1000, max=1000, default=0, subtype='PIXEL', update=_changed)
     distortion_enabled: BoolProperty(name='Distortion', description='Native sinusoidal stroke displacement; maps and random variation are not implemented', default=False, update=_changed)
-    distortion_amplitude: FloatProperty(name='Amount', description='Sinusoidal displacement amplitude in pixels', min=0, max=1000, default=5, subtype='PIXEL', update=_changed)
-    distortion_wavelength: FloatProperty(name='Cycles', description='Distance per sinusoidal cycle in pixels', min=1, max=10000, default=100, subtype='PIXEL', update=_changed)
-    distortion_phase: FloatProperty(name='Phase', description='Sinusoidal phase angle', min=-30*math.pi, max=30*math.pi, default=0, subtype='ANGLE', update=_changed)
+    distortion_amplitude: FloatProperty(name='Amount', description='Sinusoidal displacement amplitude in pixels', min=0, max=1000, default=5, subtype='PIXEL', update=_wave_changed)
+    distortion_wavelength: FloatProperty(name='Cycles', description='Distance per sinusoidal cycle in pixels', min=1, max=10000, default=100, subtype='PIXEL', update=_wave_changed)
+    distortion_phase: FloatProperty(name='Phase', description='Sinusoidal phase angle', min=-30*math.pi, max=30*math.pi, default=0, subtype='ANGLE', update=_wave_changed)
     size_curve_enabled: BoolProperty(name='Stroke Size Reduction Settings', description='Use the editable stroke-size curve instead of the legacy endpoint taper', default=False, update=_curve_enabled_changed)
     alpha_curve_enabled: BoolProperty(name='Stroke Alpha Reduction Settings', description='Multiply opacity by the editable curve along every stroke', default=False, update=_curve_enabled_changed)
     curve_tree: PointerProperty(type=bpy.types.NodeTree, poll=_curve_tree_poll, options={'HIDDEN'})

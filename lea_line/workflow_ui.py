@@ -71,7 +71,7 @@ class LEA_OT_create_camera(bpy.types.Operator):
             return {'CANCELLED'}
         # Object selection, viewport orientation and render resolution are preserved.
         ui._sync_if_enabled(scene.lea_line, context)
-        self.report({'INFO'}, '미리보기·렌더용 장면 카메라를 만들었습니다')
+        self.report({'INFO'}, '렌더용 장면 카메라를 만들었습니다')
         return {'FINISHED'}
 
 
@@ -215,21 +215,28 @@ def draw_actions(layout, context, tree=None):
     gpu_live=gpu_preview.active(context.scene)
     row = layout.row(align=True)
     preview=row.row(align=True)
-    preview.enabled=bool(settings.tree and (context.scene.camera or settings.preview_compute=='GPU'))
+    preview.enabled=bool(settings.tree)
     preview.prop(settings, 'preview_enabled', text='Viewport Preview', toggle=True, icon='HIDE_OFF')
     render=row.row(align=True);render.enabled=bool(settings.tree and context.scene.camera)
     render.operator('lea_line.render', text='Render', icon='RENDER_STILL')
     lines=layout.row();lines.enabled=bool(settings.tree and context.scene.camera)
-    lines.operator('lea_line.render_lines',text='GPU 라인만 렌더 · 투명 배경',icon='RENDERLAYERS')
-    layout.prop(settings, 'f12_gpu_lines', text='F12 GPU 선 렌더')
+    lines.operator('lea_line.render_lines',text='라인만 렌더 · 투명 배경',icon='RENDERLAYERS')
+    layout.prop(settings, 'final_line_backend')
+    layout.prop(settings, 'f12_gpu_lines', text='F12 REA 선 렌더')
+    if context.scene.render.engine == 'CYCLES':
+        layout.prop(settings, 'cycles_cpu_render')
     layout.prop(settings, 'stroke_width_profile', text='선 굵기 프로필')
     views=layout.row(align=True)
     if gpu_live or (settings.preview_compute=='GPU' and not settings.preview_enabled):
         views.label(text='GPU · 현재 시점을 자동 추적',icon='VIEW3D')
     else:
         views.operator('lea_line.follow_view',text='Follow Viewport').enabled=True
-        views.operator('lea_line.follow_view',text='Scene Camera').enabled=False
+        camera_view = views.row(align=True)
+        camera_view.enabled = context.scene.camera is not None
+        camera_view.operator('lea_line.follow_view',text='Scene Camera').enabled=False
     layout.prop(settings,'preview_compute',text='뷰포트 계산')
+    if settings.preview_compute == 'GPU':
+        layout.prop(settings, 'preview_cache_mib', text='GPU 캐시 (MiB)')
     if settings.preview_enabled:
         from . import free_view
         entry=free_view._entries.get(context.scene.as_pointer())
@@ -238,7 +245,12 @@ def draw_actions(layout, context, tree=None):
             layout.label(text='곡선 · 점선 · 맵 · 숨은 선 (GPU)',icon='INFO')
             layout.label(text='Native와 시작점·연결부·AA 차이 있음',icon='INFO')
         else:
-            layout.label(text='자유 시점 추적 중' if entry else '카메라 기준 미리보기 · Numpad 0', icon='CAMERA_DATA')
+            if entry:
+                layout.label(text='자유 시점 추적 중', icon='VIEW3D')
+            elif context.scene.camera:
+                layout.label(text='카메라 기준 미리보기 · Numpad 0', icon='CAMERA_DATA')
+            else:
+                layout.label(text='자유 시점의 3D 뷰를 열어 주세요', icon='VIEW3D')
         if not gpu_live and settings.preview_compute=='GPU':
             layout.label(text='GPU 미지원 설정 · Native 경로 사용',icon='ERROR')
         if entry and not gpu_live:
@@ -247,7 +259,7 @@ def draw_actions(layout, context, tree=None):
                 layout.label(text='이동 중 선 숨김 · 멈추면 자동 갱신',icon='INFO')
     if context.scene.camera is None:
         layout.operator('lea_line.create_camera', text='카메라 자동 생성', icon='OUTLINER_OB_CAMERA')
-        layout.label(text='렌더용 카메라를 만듭니다' if settings.preview_compute=='GPU' else '미리보기·렌더용 카메라를 만듭니다', icon='INFO')
+        layout.label(text='렌더용 카메라를 만듭니다', icon='INFO')
 
 
 def draw_start(layout, context):

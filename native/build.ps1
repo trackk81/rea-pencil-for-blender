@@ -36,10 +36,16 @@ $buildInfo = [ordered]@{
     rust_source_files_sha256 = [ordered]@{
         'src/lib.rs' = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'rea_pencil_core/src/lib.rs') -Algorithm SHA256).Hash.ToLowerInvariant()
         'src/ownership.rs' = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'rea_pencil_core/src/ownership.rs') -Algorithm SHA256).Hash.ToLowerInvariant()
+        'src/cpu_lines.rs' = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'rea_pencil_core/src/cpu_lines.rs') -Algorithm SHA256).Hash.ToLowerInvariant()
         'include/rea_pencil_core.h' = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'rea_pencil_core/include/rea_pencil_core.h') -Algorithm SHA256).Hash.ToLowerInvariant()
     }
-    optional_exports = @('rea_edge_owners_abi_version', 'rea_edge_owners_v1')
-    algorithms = @('collection scope AND explicit-object OR material-slot face mask', 'detached manifold edge ownership: material > marked > crease')
+    cpu_lines_abi_version = 2
+    optional_exports = @('rea_edge_owners_abi_version', 'rea_edge_owners_v1',
+        'rea_cpu_lines_abi_version', 'rea_cpu_lines_create', 'rea_cpu_lines_prepare',
+        'rea_cpu_lines_draw', 'rea_cpu_lines_free', 'rea_cpu_lines_free_mesh')
+    algorithms = @('collection scope AND explicit-object OR material-slot face mask',
+        'detached manifold edge ownership: material > marked > crease',
+        'CPU mesh depth and premultiplied solid or textured stroke coverage')
 }
 $buildInfo | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $nativeOutput 'build_info.json') -Encoding UTF8
 Write-Output $buildInfo

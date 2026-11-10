@@ -14,7 +14,7 @@ def cleanup(obj):
             if g.users==0:bpy.data.node_groups.remove(g)
 
 
-def build(scene,brush,chosen,line_set=None):
+def build(scene,brush,chosen,line_set=None,stamp_pattern=(1., 0.)):
     g=bpy.data.node_groups.new('.rea screen texture maps','GeometryNodeTree');g[tex.TAG]=1
     try:
         g.interface.new_socket(name='Geometry',in_out='INPUT',socket_type='NodeSocketGeometry')
@@ -34,23 +34,27 @@ def build(scene,brush,chosen,line_set=None):
             return n.outputs[0]
         def color_mix(a,b,t):
             n=node('ShaderNodeMixRGB');feed(t,n.inputs[0]);feed(a,n.inputs[1]);feed(b,n.inputs[2]);return n.outputs[0]
-        from . import preview_stroke
+        from . import preview_stroke, stamp_brush
         geometry,fields=preview_stroke._project(g,node('NodeGroupInput').outputs[0],scene)
-        if 'distortion' not in chosen:geometry=preview_stroke._resample(g,geometry,'Texture Pixel Samples')
+        if 'distortion' not in chosen:
+            spacing, jitter = stamp_pattern
+            geometry=preview_stroke._resample(g,geometry,'Texture Pixel Samples',spacing)
+            if jitter:
+                geometry=stamp_brush.jitter_stamps(g, geometry, jitter)
         geometry=preview_stroke._unproject(g,geometry,fields)
-        _,perspective,factor,_=preview_camera.projection(scene)
+        camera,perspective,factor,_=preview_camera.projection(scene)
         g.nodes['Projection Pixel Unit'].outputs[0].default_value=factor
         g.nodes['Projection Pixel Aspect'].outputs[0].default_value=scene.render.pixel_aspect_x/scene.render.pixel_aspect_y
         for name in ('Restore Depth','Restore Pixel Size'):g.nodes[name].inputs['Switch'].default_value=perspective
         rel=node('ShaderNodeVectorMath');rel.operation='SUBTRACT'
         links.new(fields['position'],rel.inputs[0]);links.new(fields['camera_location'],rel.inputs[1])
-        frame=scene.camera.data.view_frame(scene=scene);persp=scene.camera.data.type=='PERSP'
-        divisor=abs(frame[0].z) if persp else 1
+        frame=camera.data.view_frame(scene=scene)
+        divisor=abs(frame[0].z) if perspective else 1
         coords=[]
         for axis,basis in ((0,'right'),(1,'up')):
             dot=node('ShaderNodeVectorMath');dot.operation='DOT_PRODUCT'
             links.new(rel.outputs[0],dot.inputs[0]);links.new(fields[basis],dot.inputs[1])
-            p=math('DIVIDE',dot.outputs['Value'],fields['depth']) if persp else dot.outputs['Value']
+            p=math('DIVIDE',dot.outputs['Value'],fields['depth']) if perspective else dot.outputs['Value']
             lo=min(v[axis] for v in frame)/divisor;hi=max(v[axis] for v in frame)/divisor
             coords.append(math('DIVIDE',math('SUBTRACT',p,lo),hi-lo))
         from . import object_uv
@@ -134,7 +138,6 @@ def build(scene,brush,chosen,line_set=None):
         from . import hidden_mask
         geometry=hidden_mask.live(g,geometry,brush,fields,scene)
         geometry=stroke_variation.live(g,geometry,brush)
-        from . import stamp_brush
         geometry=stamp_brush.live_geometry(g,geometry,brush)
         links.new(geometry,node('NodeGroupOutput').inputs[0])
         return g
@@ -149,11 +152,15 @@ def sync(obj,brush,scene,line_set=None):
     from . import stamp_brush
     stamps=stamp_brush.spec(brush)
     if not chosen and variation is None and stamps is None and not getattr(brush,'hidden_mask_objects',()):cleanup(obj);return
-    frame=scene.camera.data.view_frame(scene=scene)
+    from . import backend
+    stamp_map = stamp_brush.detail_map(brush, 'brush') if stamps else None
+    pattern = stamp_brush.preview_pattern(stamp_map, brush.thickness * backend.width_scale(scene, line_set)) if stamp_map else (1., 0.)
+    camera, _, _, _ = preview_camera.projection(scene)
+    frame=camera.data.view_frame(scene=scene)
     from . import object_uv
     schema=object_uv.schema_key(scene,line_set,chosen)
     key=json.dumps((tuple(tuple(v) for v in frame),preview_camera.signature(scene),tuple(brush.color),schema,
-        brush.color_map_opacity,brush.size_map_amount,variation,stamps,getattr(brush,'distortion_map_amount',0),tuple(o.as_pointer() for o in getattr(brush,'hidden_mask_objects',())),
+        brush.color_map_opacity,brush.size_map_amount,variation,stamps,pattern,getattr(brush,'distortion_map_amount',0),tuple(o.as_pointer() for o in getattr(brush,'hidden_mask_objects',())),
         [(kind,n.source_type,n.object_color_selection_mode,n.object_color_index,n.object_color_name,n.image.as_pointer() if n.image else None,tuple(n.image.size) if n.image else None,n.wrap_mode_u,n.wrap_mode_v,n.filter_mode,
           tuple(n.tiling),tuple(n.offset),n.rotation,n.uv_source,n.uv_selection_mode,n.uv_index,n.uv_name,
           sorted(getattr(n,'rule_colors',{}).items())) for kind,n in chosen.items()]))
@@ -163,7 +170,7 @@ def sync(obj,brush,scene,line_set=None):
         index=list(obj.modifiers).index(modifier)
         if index!=len(obj.modifiers)-1:obj.modifiers.move(index,len(obj.modifiers)-1)
         return
-    graph=build(scene,brush,chosen,line_set);graph['signature']=key
+    graph=build(scene,brush,chosen,line_set,pattern);graph['signature']=key
     if any(object_uv.surface_source(n) for n in chosen.values()):object_uv.request_prepare(scene)
     old=modifier.node_group if modifier else None
     if modifier is None:modifier=obj.modifiers.new('.rea screen texture maps','NODES')

@@ -40,6 +40,31 @@ def render():
  return rgba,report
 a,base=render();assert a[:,:,3].sum()>100
 checks['render_graph_and_settings_restored']=True
+# The CPU engine must extract/render its own depth, even when GPU ink is unavailable.
+gpu_resources=gpu_preview._resources
+gpu_preview._resources=lambda:(_ for _ in ()).throw(AssertionError('GPU line shader requested'))
+s.lea_line.final_line_backend='CPU'
+try:
+ cpu,report=render()
+ assert report['line_backend']=='CPU' and 'CPU_raster_seconds' in report
+ assert cpu[:,:,3].sum()>100 and cpu[0,0,3]==0
+ bpy.ops.mesh.primitive_plane_add(size=3,location=(0,0,2));occluder=bpy.context.object
+ try:
+  occluded,_=render();assert not occluded[:,:,3].any()
+ finally:
+  bpy.data.objects.remove(occluder,do_unlink=True)
+ s.render.engine='REA_PENCIL_CPU'
+ with ui.suspend_sync(): detail.dashed=True
+ try:
+  render();raise AssertionError('CPU accepted dashed brush')
+ except RuntimeError as error:
+  assert 'Simple' in str(error)
+ assert s.render.engine=='REA_PENCIL_CPU'
+finally:
+ with ui.suspend_sync(): detail.dashed=False
+ s.render.engine='BLENDER_EEVEE_NEXT';s.lea_line.final_line_backend='GPU'
+ gpu_preview._resources=gpu_resources
+checks['CPU_lines_have_transparency_depth_and_explicit_style_validation_without_GPU_ink']=True
 # Native GP is present, but cannot contribute to REA-only output.
 gp.hide_render=True
 s.render.filepath=str(OUT/'GP_manually_excluded.png');gpu_render.render_lines(s,write_still=True)
@@ -63,6 +88,37 @@ bulk=gpu_render.publish
 gpu_render.publish=lambda layer,rgba:setattr(layer.passes['Combined'],'rect',rgba.reshape(-1,4))
 reference,_=render();gpu_render.publish=bulk
 assert np.array_equal(a,reference);checks['bulk_transfer_matches_reference_exactly']=True
+material=bpy.data.materials.new('Selected material');other_material=bpy.data.materials.new('Other material')
+cube.data.materials.append(material);cube.data.materials.append(other_material)
+bpy.ops.mesh.primitive_cube_add(size=1,location=(2,0,0));other=bpy.context.object
+other.data.materials.append(other_material)
+with ui.suspend_sync():
+ n.objects.clear();n.materials.add().material=material
+material_only,material_result=render()
+assert np.array_equal(a,material_only) and material_result['depth_triangles']>base['depth_triangles']
+cube.data.polygons[0].material_index=1
+try:
+ render();raise AssertionError('Mixed material faces accepted')
+except RuntimeError as error:
+ assert cube.name in str(error)
+cube.data.polygons[0].material_index=0
+with ui.suspend_sync():n.objects.add().object=other
+both,both_result=render()
+assert both[:,:,3].sum()>material_only[:,:,3].sum()
+checks['whole_mesh_material_targets_and_explicit_objects_share_render_depth']=True
+limit=gpu_preview.MAX_GROUP_EDGES
+try:
+ gpu_preview.MAX_GROUP_EDGES=base['edges']
+ streamed,streamed_result=render()
+ assert streamed_result['edges']==both_result['edges']>gpu_preview.MAX_GROUP_EDGES
+ assert np.array_equal(streamed,both)
+finally:
+ gpu_preview.MAX_GROUP_EDGES=limit
+checks['object_group_streaming_above_aggregate_edge_limit_is_pixel_identical']=True
+with ui.suspend_sync():
+ n.materials.clear();n.objects.clear();n.objects.add().object=cube
+bpy.data.objects.remove(other,do_unlink=True)
+cube.data.materials.clear()
 cube.hide_set(True);bpy.context.view_layer.update()
 view=gpu_preview.snapshot(s,bpy.context.evaluated_depsgraph_get());assert view['edges']==0
 hidden_view,_=render();assert np.array_equal(a,hidden_view);checks['render_visibility_independent_of_viewport_hide']=True

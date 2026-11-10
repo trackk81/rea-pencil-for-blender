@@ -154,8 +154,10 @@ def _position(graph, name, geometry, position=None, offset=None):
     return node.outputs[0]
 
 
-def _resample(graph, geometry, name):
+def _resample(graph, geometry, name, spacing=1.):
     length = _node(graph, 'GeometryNodeSplineLength', name + ' Length').outputs['Length']
+    if spacing != 1.:
+        length = _math(graph, 'DIVIDE', name + ' Intervals', length, spacing)
     count = _math(graph, 'ADD', name + ' Count', _math(graph, 'CEIL', name + ' Round', length), 1)
     count = _math(graph, 'MINIMUM', name + ' Budget', count, 16384)
     resample = _node(graph, 'GeometryNodeResampleCurve', name)

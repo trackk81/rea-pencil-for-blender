@@ -14,6 +14,31 @@ checks={}
 assert 'FINISHED' in bpy.ops.lea_line.prepared_render('EXEC_DEFAULT')
 assert f12_render.LAST_INVOCATION['route']=='GPU' and f12_render.LAST_INVOCATION['output']=='COMPOSITE'
 checks['existing_F12_preparation_operator_dispatches_GPU_composite']=True
+s.render.engine='CYCLES';s.cycles.samples=1;s.cycles.device='GPU'
+s.render.compositor_device='GPU';s.lea_line.cycles_cpu_render=True
+cpu_passes=[]
+def watch_cpu_passes(scene,*args):
+ cpu_passes.append((scene.render.engine,scene.cycles.device,scene.render.compositor_device))
+bpy.app.handlers.render_pre.append(watch_cpu_passes)
+try:
+ assert 'FINISHED' in bpy.ops.lea_line.prepared_render('EXEC_DEFAULT')
+finally:
+ bpy.app.handlers.render_pre.remove(watch_cpu_passes)
+assert cpu_passes==[('REA_PENCIL_GPU','GPU','GPU'),('CYCLES','CPU','CPU')],cpu_passes
+assert s.render.engine=='CYCLES' and s.cycles.device=='GPU' and s.render.compositor_device=='GPU'
+checks['F12_Cycles_CPU_beauty_and_compositor_restore_devices']=True
+cpu_passes.clear()
+s.lea_line.final_line_backend='CPU'
+bpy.app.handlers.render_pre.append(watch_cpu_passes)
+try:
+ assert 'FINISHED' in bpy.ops.lea_line.prepared_render('EXEC_DEFAULT')
+finally:
+ bpy.app.handlers.render_pre.remove(watch_cpu_passes)
+assert cpu_passes==[('REA_PENCIL_CPU','GPU','GPU'),('CYCLES','CPU','CPU')],cpu_passes
+assert f12_render.LAST_INVOCATION['route']=='CPU' and gpu_render.LAST_RESULT['alpha_mass']>0
+assert s.cycles.device=='GPU' and s.render.compositor_device=='GPU'
+checks['F12_CPU_lines_and_Cycles_CPU_beauty_restore_devices']=True
+s.lea_line.final_line_backend='GPU'
 s.render.engine='REA_PENCIL_GPU'
 assert 'FINISHED' in bpy.ops.lea_line.prepared_render('EXEC_DEFAULT')
 assert f12_render.LAST_INVOCATION['output']=='LINES' and gpu_render.LAST_RESULT['status']=='ok'

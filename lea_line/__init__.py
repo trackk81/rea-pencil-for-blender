@@ -3,7 +3,7 @@
 bl_info = {
     "name": "rea pencil for blender",
     "author": "rea pencil contributors",
-    "version": (0, 28, 15),
+    "version": (0, 28, 16),
     "blender": (4, 4, 0),
     "location": "View3D > Sidebar > REA Pencil Line / Node Editor > REA Pencil Line",
     "description": "Node-driven outlines, creases, material boundaries and hidden lines",
@@ -26,7 +26,7 @@ if _applied:
     globals().pop('update_core', None)
     exec(compile(_Path(__file__).read_bytes(), __file__, 'exec'), globals())
 else:
-    from . import backend, ui, presets, reference_controls, preview_material, updater, gpu_preview, gpu_render, f12_render
+    from . import backend, ui, presets, reference_controls, preview_material, updater, gpu_preview, gpu_render, f12_render, brush_sample
 
     _registered = False
 
@@ -37,7 +37,7 @@ else:
             return
         completed = []
         try:
-            for module in (reference_controls, ui, presets, preview_material, backend, gpu_preview, gpu_render, f12_render, updater):
+            for module in (reference_controls, ui, presets, preview_material, backend, gpu_preview, gpu_render, f12_render, updater, brush_sample):
                 module.register()
                 completed.append(module)
         except Exception:
@@ -54,6 +54,7 @@ else:
         import bpy
         from . import viewport
         from . import render_cache
+        brush_sample.unregister()
         updater.unregister()
         f12_render.unregister()
         gpu_render.unregister()

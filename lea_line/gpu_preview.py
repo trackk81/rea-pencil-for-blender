@@ -18,6 +18,7 @@ _shader = None
 _batch = None
 _building = False
 MAX_STROKE_WIDTH = 512
+MAX_GROUP_EDGES = 2_000_000
 
 
 def active(scene):
@@ -34,7 +35,12 @@ def _tag_redraw(scene):
 
 def stats(scene):
     entry = _states.get(scene.as_pointer(), {})
-    return {key: entry.get(key) for key in ('edges', 'build_ms', 'draw_ms', 'draws', 'uploads', 'dirty', 'error')}
+    cache = entry.get('buffer_cache')
+    cache_stats = ({'cache_bytes': cache.bytes, 'cache_limit_bytes': cache.limit,
+                    'cache_evictions': cache.evictions, 'streamed_bytes': cache.streamed,
+                    'scene_depth_bytes': entry.get('scene_depth_bytes', 0)} if cache else {})
+    return {**{key: entry.get(key) for key in ('edges', 'build_ms', 'draw_ms', 'draws', 'uploads',
+                                             'groups_culled', 'dirty', 'error')}, **cache_stats}
 
 
 def _jobs(scene):
@@ -43,12 +49,15 @@ def _jobs(scene):
         raise ValueError('GPU 시험 경로는 단일 뷰 레이어만 지원합니다')
     jobs = []
     for node, common in backend._specifications(scene.lea_line.tree, with_output=True):
-        if material_scope.active(node) or node.use_material_functions:
-            raise ValueError('GPU: 재질별 얼굴 선택·Line Functions는 Native를 사용하세요')
+        has_material_targets = material_scope.active(node)
+        if node.use_material_functions:
+            raise ValueError('GPU: Line Functions는 Native를 사용하세요')
         # Resolve identities without creating/linking helper collections inside
         # a render callback. Render depsgraph objects are evaluated copies.
         scope = ({obj.original for obj in node.source_collection.all_objects}
                  if node.source_collection else None)
+        material_filter = ((scope, {mat.original for mat in material_scope.target_materials(node)})
+                           if has_material_targets else None)
         listed = getattr(node, 'objects', ())
         if len(listed):
             # An instance source may be absent from scene.objects. The actual
@@ -56,7 +65,7 @@ def _jobs(scene):
             targets = {item.object.original for item in listed if item.object}
             if scope is not None:
                 targets.intersection_update(scope)
-        elif getattr(node, 'target_mode', 'ALL') == 'ALL' or node.source_collection:
+        elif not has_material_targets and (getattr(node, 'target_mode', 'ALL') == 'ALL' or node.source_collection):
             targets = scope
         else:
             targets = set()
@@ -101,10 +110,13 @@ def _jobs(scene):
                 if stroke_variation.snapshot(brush) is not None:
                     raise ValueError('GPU: 랜덤 브러시는 Native를 사용하세요')
                 gpu_styles.validate(brush)
-                if getattr(brush,'brush_type','SIMPLE')=='MULTIPLE' or getattr(brush,'brush_map_on',False):raise ValueError('GPU: 다중 스탬프·브러시 맵은 Native를 사용하세요')
                 if getattr(brush,'distortion_map_on',False):raise ValueError('GPU: 왜곡 맵은 Native를 사용하세요')
                 if getattr(brush,'caps','ROUND')!='ROUND' or getattr(brush,'hidden_mask_objects',()):raise ValueError('GPU: Round 캡만 지원하며 숨은 선 마스크는 Native를 사용하세요')
-                if (abs(getattr(brush,'stretch',0.))>1e-6 or getattr(brush,'groove',0.) or abs(getattr(brush,'stamp_reduction_start',1.)-1.)>1e-6 or abs(getattr(brush,'stamp_reduction_end',1.)-1.)>1e-6):raise ValueError('GPU: 스탬프 변형은 Native를 사용하세요')
+                if not gpu_styles.stamp_coverage.enabled(brush) and (
+                        abs(getattr(brush,'stretch',0.))>1e-6 or getattr(brush,'groove',0.)
+                        or abs(getattr(brush,'stamp_reduction_start',1.)-1.)>1e-6
+                        or abs(getattr(brush,'stamp_reduction_end',1.)-1.)>1e-6):
+                    raise ValueError('GPU: 스탬프 변형은 Native를 사용하세요')
                 proxy = routing.ResolvedBrush(node, {
                     key: key == feature if feature else routing.feature_enabled(node, key, visibility)
                     for key in features})
@@ -121,11 +133,15 @@ def _jobs(scene):
                     raise ValueError('GPU: Normal Offset은 단독 Marked Edge를 지원합니다')
                 proxy.overrides['_gpu_normal_offset'] = normal_offset
                 distortion = bool(gpu_styles.wave_amount(brush))
-                if distortion and (object_mode or not proxy.edge_mark or
-                                   any(getattr(proxy,k) for k in features if k!='edge_mark')):
-                    raise ValueError('GPU: 파형 왜곡은 단독 Marked Edge를 지원합니다')
+                wave_contour = (visibility == 'VISIBLE' and not merge_groups and not object_enabled
+                                and (object_mode == -1 and proxy.outline
+                                     or object_mode in {2, 3} and proxy.crease))
+                if distortion and not wave_contour and (object_mode or not proxy.edge_mark or
+                        any(getattr(proxy, k) for k in features if k != 'edge_mark')):
+                    raise ValueError('GPU: 파형 왜곡은 보이는 Outline·Normal Angle 또는 단독 Marked Edge를 지원합니다')
                 proxy.overrides['_gpu_distortion'] = distortion
                 proxy.overrides['_gpu_hidden'] = visibility == 'HIDDEN'
+                proxy.overrides['_gpu_material_filter'] = material_filter
                 proxy.overrides['outline_open'] = outline_open
                 proxy.overrides['object_open'] = object_open
                 proxy.overrides['_gpu_object_mode'] = object_mode
@@ -276,7 +292,9 @@ def _records(mesh, matrix, node, payload=None):
         handedness = np.sign(np.linalg.det(transform[:3, :3]))
         result[manifold, 2, 3] = np.where(loop_vertices[first_loop[edge_mask]] == endpoint, handedness, -handedness)
         result[manifold, 3, 3] = np.where(loop_vertices[last_loop[edge_mask]] == endpoint, handedness, -handedness)
-        if distortion:
+        if distortion and object_mode and not np.all(manifold):
+            raise ValueError('GPU: 비매니폴드 모서리의 Outline·Normal Angle 파형은 Native를 사용하세요')
+        if distortion and not object_mode:
             if not np.all(counts[chosen] == 2) or np.any(np.linalg.norm(n1[chosen]-n0[chosen], axis=1) > 1e-6):
                 raise ValueError('GPU: 파형 왜곡은 같은 평면의 두 면이 만나는 Marked Edge를 지원합니다')
             degree = np.bincount(endpoints.ravel(), minlength=nv)
@@ -322,7 +340,7 @@ def _channel(brush, kind):
 
 def _stroke_group(brush, width, style, parts, object_depth=None):
     records, normals, maps, vertices, endpoints = parts
-    if len(records) > 2_000_000:
+    if len(records) > MAX_GROUP_EDGES:
         raise ValueError('GPU 시험 경로의 모서리 메모리 한도를 넘었습니다')
     if 'size' in style['maps'] and style['maps']['size'].source_type == 'OBJECTCOLOR' and len(records):
         maximum = float(np.max(maps[:, 4:8, :3] @ np.array((.2126, .7152, .0722))))
@@ -336,6 +354,27 @@ def _stroke_group(brush, width, style, parts, object_depth=None):
             'size_reduction': _channel(brush, 'SIZE'), 'alpha_reduction': _channel(brush, 'ALPHA')}
 
 
+def _whole_mesh_material_target(mesh, obj, materials):
+    from . import native_core
+    slots = [bool(slot.material and slot.material.original in materials) for slot in obj.material_slots]
+    if not any(slots) or not mesh.polygons:
+        return False
+    attr = mesh.attributes.get('material_index')
+    if attr is None:
+        return slots[0]
+    if attr.domain == 'FACE' and attr.data_type == 'INT':
+        indices = np.empty(len(mesh.polygons), np.int32)
+        attr.data.foreach_get('value', indices)
+        mask = native_core.material_face_mask(indices, slots)
+    else:
+        mask = native_core.mesh_material_mask(mesh, slots)
+    if not mask.any():
+        return False
+    if not mask.all():
+        raise ValueError(f'GPU: {obj.name}의 일부 면만 재질 대상으로 선택되어 있습니다. 같은 메시의 모든 면을 선택하거나 Objects 대상으로 지정하세요')
+    return True
+
+
 def snapshot(scene, dg):
     """Copy evaluated geometry without installing viewport handlers or timers.
 
@@ -344,6 +383,7 @@ def snapshot(scene, dg):
     """
     from . import backend, gpu_styles, gpu_depth, routing, width_profile
     start = time.perf_counter()
+    render = dg.mode == 'RENDER'
     jobs = _jobs(scene)
     groups = []
     source_ids = set()
@@ -355,8 +395,9 @@ def snapshot(scene, dg):
     # its own sloping surface. Classify the centerline against our unjittered
     # mesh depth in every shading mode, then draw the whole stroke as overlay.
     needs_depth=True
-    depth_data = gpu_depth.snapshot(dg, members)
+    depth_data = gpu_depth.snapshot(dg, members, index_ranges=not render)
     merge_depths = depth_data.pop('merge_depths')
+    object_ranges = depth_data.pop('object_ranges')
     for merged in merge_depths.values():
         merged['areas'] = object_areas
     for node, brush, targets in jobs:
@@ -366,9 +407,11 @@ def snapshot(scene, dg):
         width = brush.thickness * scale
         object_mode = getattr(node, '_gpu_object_mode', 0)
         merge_mode = node._gpu_merge_mode
+        material_filter = node._gpu_material_filter
         object_records = 0
         style=gpu_styles.snapshot(brush,scale,getattr(node,'_gpu_hidden',False),needs_depth,
                                   output=getattr(node,'line_output',None))
+        limit_total = style['needs_chain'] or bool(style['maps'])
         profile = scene.lea_line.stroke_width_profile
         if (profile == 'PENCIL_SIMPLE' and getattr(brush, 'brush_type', 'SIMPLE') == 'SIMPLE'
                 and width_profile.live_coverage_supported(brush) and 'size' not in style['maps']
@@ -389,12 +432,19 @@ def snapshot(scene, dg):
             parent=instance.parent.original if instance.is_instance and instance.parent else None
             if obj.type != 'MESH' or not instance.show_self:
                 continue
-            if targets is not None and obj.original not in targets and parent not in targets:
-                continue
-            if dg.mode != 'RENDER' and not instance.is_instance and not obj.original.visible_get(view_layer=dg.view_layer):
+            targeted = targets is None or obj.original in targets or parent in targets
+            if not targeted:
+                if material_filter is None:
+                    continue
+                scope, materials = material_filter
+                if scope is not None and obj.original not in scope:
+                    continue
+            if not render and not instance.is_instance and not obj.original.visible_get(view_layer=dg.view_layer):
                 continue
             mesh = obj.to_mesh()
             try:
+                if not targeted and not _whole_mesh_material_target(mesh, obj, materials):
+                    continue
                 merged = merge_depths.get(members.get(obj.original)) if merge_mode else None
                 payload={};records,extra=_records(mesh, instance.matrix_world, merged_node if merged is not None else node,payload)
                 if payload.get('mixed_normal_directions'):
@@ -408,17 +458,23 @@ def snapshot(scene, dg):
                         vertices = payload['world_vertices'][used]
                         ends = inverse.reshape(-1,2)
                     if object_mode or merged is not None:
-                        object_records += len(records)
-                        if object_records > 2_000_000:
-                            raise ValueError('GPU 시험 경로의 모서리 메모리 한도를 넘었습니다')
+                        # Simple strokes already have an independent upload
+                        # per object. Keep the aggregate guard for effects.
+                        if limit_total:
+                            object_records += len(records)
+                            if object_records > MAX_GROUP_EDGES:
+                                raise ValueError('GPU 시험 경로의 모서리 메모리 한도를 넘었습니다')
                         if merged is None:
                             # Blender can reuse the evaluated instance wrapper
                             # while iterating. Cache by stable source identity.
-                            key = (obj.original.as_pointer(), tuple(tuple(row) for row in instance.matrix_world))
+                            key = gpu_depth.instance_key(obj, instance.matrix_world)
                             if key not in object_depths:
-                                object_depths[key] = {'vertices': payload['world_vertices'],
-                                                      'triangles': gpu_depth.mesh_triangles(mesh),
-                                                      'areas': object_areas}
+                                depth = {'vertices': payload['world_vertices'], 'areas': object_areas}
+                                if key in object_ranges:
+                                    depth.update(source=depth_data, index_range=object_ranges[key])
+                                else:
+                                    depth['triangles'] = gpu_depth.mesh_triangles(mesh)
+                                object_depths[key] = depth
                             depth = object_depths[key]
                         else:
                             depth = merged
@@ -446,18 +502,89 @@ def snapshot(scene, dg):
         groups.append(_stroke_group(brush, width, style, parts))
     for group in groups:
         for obj in group['style']['references']:source_ids.add(obj.as_pointer())
+        image = group['style']['stamp_image']
+        if image:source_ids.add(image.as_pointer())
         for n in group['style']['maps'].values():
             if getattr(n,'image',None):source_ids.add(n.image.as_pointer())
+    edges = sum(len(g['records']) for g in groups)
+    if not render:
+        groups = [part for group in groups for part in _preview_chunks(group)]
+    culling = _viewport_bounds(groups) if not render and edges > MAX_GROUP_EDGES else None
     return {'groups': groups, 'source_ids': source_ids,'depth':depth_data,'object_areas':object_areas,
-        'edges': sum(len(g['records']) for g in groups), 'build_ms': (time.perf_counter()-start)*1000,
+        'edges': edges, 'viewport_bounds': culling, 'build_ms': (time.perf_counter()-start)*1000,
         'draw_ms': 0., 'draws': 0, 'uploads': 0, 'dirty': False, 'error': ''}
+
+
+def _preview_chunks(group):
+    # Keep one simple upload near 16 MiB rather than reserving a large mesh's
+    # full edge texture as scratch. Authored chain/map data stays intact.
+    records, normals = group['records'], group['extra_normals']
+    style = group['style']
+    chunk_edges = 262_144
+    if len(records) <= chunk_edges or style['needs_chain'] or style['maps']:
+        yield group
+        return
+    for start in range(0, len(records), chunk_edges):
+        part = records[start:start+chunk_edges]
+        has_normals = part[:,3,3] > 2
+        local_normals = normals[:0]
+        if has_normals.any():
+            offsets = part[has_normals,2,3].astype(np.intp)
+            counts = part[has_normals,3,3].astype(np.intp)
+            first, end = offsets.min(), (offsets+counts).max()
+            local_normals = normals[first:end]
+            part = part.copy()
+            part[has_normals,2,3] -= first
+        yield dict(group, records=part, extra_normals=local_normals)
+
+
+def _viewport_bounds(groups):
+    # Cull whole offscreen stroke groups. Every scene mesh remains in the
+    # depth pass, and the GPU retains full topology for subsequent views.
+    indices, centers, extents, padding = [], [], [], []
+    by_object = {}
+    for index, group in enumerate(groups):
+        depth = group['object_depth']
+        style = group['style']
+        if depth is None or style['needs_chain'] or style['maps'] or not len(group['records']):
+            continue
+        key = id(depth)
+        if key not in by_object:
+            points = depth['vertices']
+            low, high = points.min(axis=0), points.max(axis=0)
+            by_object[key] = (low+high)*.5, (high-low)*.5
+        center, extent = by_object[key]
+        params = style['params']
+        radius = group['width'] * params[3,2] * max(1., group['size_reduction'][2]) * .5
+        margin = radius + max(1., params[19,1]) + np.max(np.abs(params[17,:2])) + 1.
+        indices.append(index)
+        centers.append(center)
+        extents.append(extent)
+        padding.append(margin)
+    if indices:
+        return np.asarray(indices), np.asarray(centers), np.asarray(extents), np.asarray(padding)
+    return None
+
+
+def _offscreen_groups(bounds, projection, size):
+    if bounds is None:
+        return set()
+    indices, centers, extents, padding = bounds
+    matrix = np.asarray(projection, dtype=np.float64)
+    culled = np.zeros(len(indices), dtype=bool)
+    for axis, sign in ((0,1), (0,-1), (1,1), (1,-1)):
+        planes = (1+2*padding[:,None]/size[axis])*matrix[3] + sign*matrix[axis]
+        normal = planes[:,:3]
+        support = np.sum(centers*normal+extents*np.abs(normal),axis=1)+planes[:,3]
+        culled |= support < -1e-5
+    return set(indices[culled])
 
 
 def sync(scene):
     global _handle, _building
     if bpy.app.background:
         raise ValueError('GPU 미리보기는 Blender 창에서 사용하세요')
-    from . import backend,gpu_styles,gpu_depth
+    from . import gpu_preview_cache
     from . import free_view
     followed=free_view._entries.get(scene.as_pointer())
     if followed:free_view._restore_navigation(followed)
@@ -466,7 +593,9 @@ def sync(scene):
         window=next((w for w in bpy.context.window_manager.windows if w.scene==scene),None)
         if window is None:raise ValueError('GPU 미리보기 장면을 Blender 창에서 여세요')
         with bpy.context.temp_override(window=window):dg = bpy.context.evaluated_depsgraph_get()
-        _states[scene.as_pointer()] = snapshot(scene, dg)
+        entry = snapshot(scene, dg)
+        entry['buffer_cache'] = gpu_preview_cache.BufferCache()
+        _states[scene.as_pointer()] = entry
         if _handle is None:_handle = bpy.types.SpaceView3D.draw_handler_add(_draw, (), 'WINDOW', 'POST_VIEW')
         if not bpy.app.timers.is_registered(_watch):bpy.app.timers.register(_watch, first_interval=.2)
         from . import curves,preview_runtime
@@ -474,6 +603,24 @@ def sync(scene):
     finally:_building = False
     _tag_redraw(scene)
     return ['GPU 시험 미리보기: Solid/재질/Rendered · 곡선/점선/맵/숨은 선. 분기점은 선을 나누며 루프 시작·위상·연결부·AA는 Native와 다릅니다']
+
+
+def refresh_wave(scene, detail):
+    entry = _states.get(scene.as_pointer())
+    if (not entry or entry['dirty'] or entry['error'] or scene.lea_line.preview_compute != 'GPU'
+            or bpy.app.is_job_running('RENDER')):
+        return False
+    amplitude = detail.distortion_amplitude if detail.distortion_enabled else 0.
+    styles = {id(group['style']): group['style'] for group in entry['groups']
+              if group['style']['wave_detail'] == detail.as_pointer()}
+    if not styles or any(bool(style['params'][18,0]) != bool(amplitude) for style in styles.values()):
+        return False
+    for style in styles.values():
+        scale = style['wave_scale']
+        style['params'][18,:3] = amplitude*scale, max(.0001,detail.distortion_wavelength*scale), detail.distortion_phase
+        style['wave_revision'] += 1
+    _tag_redraw(scene)
+    return True
 
 
 JOINT_DEPTH = CENTER_DEPTH + MARKED_DEPTH + SPAN_LENGTH + r'''
@@ -557,6 +704,14 @@ vec2 normalShift(int edge,vec4 p,vec4 q,vec4 points,vec2 normal,float side,bool 
     // Intersection of the two displaced edge tangents, with a bounded miter.
     return bisector*min(1.0/denominator,4.0/max(length(bisector),1e-5));
 }
+bool waveCorner(int link,vec4 joint,vec2 inward) {
+    if (link<0) return false;
+    vec4 far=viewProjection*vec4(record(link/2,1-link%2).xyz,1);
+    float j=joint.z+joint.w, f=far.z+far.w;
+    if (f<=0.0) far=mix(joint,far,j/(j-f));
+    vec2 outgoing=(far.xy/far.w-joint.xy/joint.w)*viewportSize;
+    return length(outgoing)>1e-5 && dot(normalize(outgoing),inward)>-.985;
+}
 void main() {
     bool mixed=texelFetch(styleData,ivec2(17,0),0).w>.5;
     int edge=mixed?gl_InstanceID/2:gl_InstanceID;
@@ -570,6 +725,7 @@ void main() {
     edgeIndex=float(edge);faceChoice=(f1>=0.0&&f0<0.0)?1.0:0.0;clipInterval=vec2(0,1);screenEnds=vec4(0);chainSpan=vec3(0);
     endExtension=vec2(0);
     waveEnds=vec2(0);
+    waveCorners=vec2(0);
     waveSide=0.0;
     normalSpans=vec4(0);
     normalSide=0.0;
@@ -605,11 +761,22 @@ void main() {
     vec2 tangent=delta/max(lengthValue,0.00001), normal=vec2(-tangent.y,tangent.x);
     vec2 shiftA=vec2(0), shiftB=vec2(0);
     float waveAmplitude=texelFetch(styleData,ivec2(18,0),0).x;
+    if (objectMode>=2.0 && abs(n1.w)==1.0) {
+        // Sample the two planes incident to a crease at the stroke center.
+        // A sloped face can otherwise cut its own crease at each depth texel.
+        normalDepthPlanes=markedDepthPlanes(viewProjection,viewportSize,p,q,wb-wa,n0,n1);
+    }
     if (waveAmplitude!=0.0) {
         waveSide=markNormalSide(n0,n1,toEye);
         if (pa<=0.0) waveEnds.x=1.0;
         if (qa<=0.0) waveEnds.y=1.0;
         normalDepthPlanes=markedDepthPlanes(viewProjection,viewportSize,p,q,wb-wa,n0,n1);
+        if (objectMode!=0.0 && lengthValue>1e-5) {
+            int width=textureSize(jointData,0).x;
+            ivec2 links=ivec2(texelFetch(jointData,ivec2(edge%width,edge/width),0).xy);
+            waveCorners=vec2(float(pa>0.0 && waveCorner(links.x,p,tangent)),
+                             float(qa>0.0 && waveCorner(links.y,q,-tangent)));
+        }
     }
     float normalOffset=texelFetch(styleData,ivec2(17,0),0).z;
     if (normalOffset!=0.0 && lengthValue>1e-5) {
@@ -778,28 +945,70 @@ float cutDistance(vec4 points,vec2 depths,float position,float reach,bool hidden
     }
     return best;
 }
-vec2 waveRun(vec2 depths,float position,float reach,bool hidden) {
-    vec4 span=readStyleTex(visibilityData,int(edgeIndex));
+float waveFirstStep(float position,float direction,float limit,bool hidden) {
+    if (directionInfo.w<1.5 || limit<32.0 || any(notEqual(normalDepthPlanes,vec4(0)))) return 1.0;
+    vec4 marker=texelFetch(waveMask,ivec2(0,int(edgeIndex)),0);
+    if (marker.x<0.0) return 1.0;
+    vec2 d=screenEnds.zw-screenEnds.xy;
+    int axis=abs(d.x)>=abs(d.y)?0:1;
+    float slope=d[axis]*direction/segmentLength;
+    float start=screenEnds[axis]+position/segmentLength*d[axis];
+    int travel=slope>0.0?1:-1;
+    int lastPixel=textureSize(waveMask,0).x*32-1;
+    int pixel=clamp(int(floor(start)),0,lastPixel);
+    int endPixel=clamp(int(floor(start+slope*limit)),0,lastPixel);
+    int endWord=endPixel/32;
+    int firstWord=pixel/32;
+    for (int word=firstWord;travel*(word-endWord)<=0;word+=travel) {
+        vec4 value=texelFetch(waveMask,ivec2(word,int(edgeIndex)),0);
+        vec2 pair=hidden?value.xy:value.zw;
+        uint bits=uint(pair.x)|(uint(pair.y)<<16u);
+        if (word==firstWord) {
+            uint bit=uint(pixel%32);
+            bits&=travel>0?(0xffffffffu<<bit):(0xffffffffu>>(31u-bit));
+        }
+        if (bits!=0u) {
+            int candidate=word*32+(travel>0?findLSB(bits):findMSB(bits));
+            float boundary=float(candidate+(travel<0?1:0));
+            // Resume the same integer step sequence before the candidate.
+            // The original binary refinement still owns the exact boundary.
+            return max(1.0,min(ceil(limit)+1.0,floor((boundary-start)/slope)-2.0));
+        }
+    }
+    return ceil(limit)+1.0;
+}
+vec2 waveRun(vec4 span,vec2 depths,float position,float reach,bool hidden) {
     if (span.z>=segmentLength-.0001) return vec2(-span.x,segmentLength+span.y);
     if (span.z>0.0 && position<=span.z) return vec2(-span.x,span.z);
     if (span.w>0.0 && position>=segmentLength-span.w) return vec2(segmentLength-span.w,segmentLength+span.y);
     // A run contained inside one edge cannot be reached by the endpoint pass.
     bool forward=chainSpan.x<chainSpan.y;
-    float before=spanLength(screenEnds,depths,segmentLength,position,-1.0,forward?segmentLength:reach,hidden,normalDepthPlanes,true);
-    float after=spanLength(screenEnds,depths,segmentLength,position,1.0,forward?reach:segmentLength,hidden,normalDepthPlanes,true);
+    float backLimit=min(position,forward?segmentLength:reach);
+    float nextLimit=min(segmentLength-position,forward?reach:segmentLength);
+    float before=spanLengthFrom(screenEnds,depths,segmentLength,position,-1.0,backLimit,hidden,normalDepthPlanes,true,
+                                waveFirstStep(position,-1.0,backLimit,hidden));
+    float after=spanLengthFrom(screenEnds,depths,segmentLength,position,1.0,nextLimit,hidden,normalDepthPlanes,true,
+                               waveFirstStep(position,1.0,nextLimit,hidden));
     return vec2(position-before,position+after);
 }
 float waveHeight(float x,vec3 wave,float origin,float direction) {
-    return waveSide*wave.x*sin(6.28318530718*(x-origin)*direction/wave.y+wave.z);
+    // The neighboring edge turns in screen space. Both strokes meet at
+    // the same vertex instead of continuing along either old tangent.
+    float taper=max(1.0,min(abs(wave.x),segmentLength*.5));
+    float join=(waveCorners.x>.5?smoothstep(0.0,taper,x):1.0)*
+               (waveCorners.y>.5?smoothstep(0.0,taper,segmentLength-x):1.0);
+    return join*waveSide*wave.x*sin(6.28318530718*(x-origin)*direction/wave.y+wave.z);
 }
 float waveDistance(float reach,vec3 wave,vec2 run) {
     // Adjacent edges share coverage only while the run continues across
     // the joint. Ignore subpixel continuation within the depth search's
     // one-pixel/1024 precision so a cut at the joint keeps its round cap.
-    if (waveEnds.x<.5 && run.x<-.001 && lineCoord.x<0.0) return reach;
-    if (waveEnds.y<.5 && run.y>segmentLength+.001 && lineCoord.x>=segmentLength) return reach;
     bool forward=chainSpan.x<chainSpan.y;
     float origin=forward?run.x:run.y, direction=forward?1.0:-1.0;
+    if (waveCorners.x>.5) run.x=max(0.0,run.x);
+    if (waveCorners.y>.5) run.y=min(segmentLength,run.y);
+    if (waveEnds.x<.5 && run.x<-.001 && lineCoord.x<0.0) return reach;
+    if (waveEnds.y<.5 && run.y>segmentLength+.001 && lineCoord.x>=segmentLength) return reach;
     float low=max(lineCoord.x-reach,run.x), high=min(lineCoord.x+reach,run.y);
     if (high<low || abs(lineCoord.y)>abs(wave.x)+reach) return reach;
     int steps=int(clamp(ceil((high-low)/min(1.0,wave.y/8.0)),1.0,64.0));
@@ -817,8 +1026,9 @@ float waveDistance(float reach,vec3 wave,vec2 run) {
     return sqrt(closest);
 }
 float cutWaveDistance(float reach,vec3 wave,vec2 depths,float position,bool hidden) {
+    vec4 span=readStyleTex(visibilityData,int(edgeIndex));
     if (spanSample(screenEnds,depths,position/segmentLength,hidden,normalDepthPlanes,true)) {
-        return waveDistance(reach,wave,waveRun(depths,position,reach,hidden));
+        return waveDistance(reach,wave,waveRun(span,depths,position,reach,hidden));
     }
     // The displaced centerline stops at the cut, but its round cap can
     // cover pixels whose projection onto the source edge is across it.
@@ -832,7 +1042,7 @@ float cutWaveDistance(float reach,vec3 wave,vec2 depths,float position,bool hidd
         float inside=position+direction*(gap+.002);
         if (inside<=0.0 || inside>=segmentLength ||
                 !spanSample(screenEnds,depths,inside/segmentLength,hidden,normalDepthPlanes,true)) continue;
-        closest=min(closest,waveDistance(reach,wave,waveRun(depths,inside,reach,hidden)));
+        closest=min(closest,waveDistance(reach,wave,waveRun(span,depths,inside,reach,hidden)));
     }
     return closest;
 }
@@ -880,9 +1090,9 @@ void main() {
         if (viewExtra.z>0.0) points-=viewExtra.xyxy;
         vec2 center=mix(points.xy,points.zw,t);
         vec4 clip=viewProjection*vec4(mix(worldA,worldB,u),1);float depth=clip.z/clip.w*.5+.5;
-        float scene=markedCenterDepth(center,points.zw-points.xy,depth,normalDepthPlanes);
         vec2 objectOptions=styleValue(6).zw;
         float objectMode=objectOptions.x;
+        float scene=markedCenterDepth(center,points.zw-points.xy,depth,normalDepthPlanes,objectDepth,objectMode>=2.0);
         if (objectMode==-1.0 && objectOptions.y<.5 && depth>scene+.000002)
             scene=outlineCenterDepth(center,depth,scene);
         bool hidden=depth>scene+.000002;
@@ -960,6 +1170,15 @@ void main() {
         coverage-=max(0.0,.5-radius-distanceValue);
     }
     if (coverage<=0.0 || radius<=0.0 || opacity<=0.0) discard;
+    float stampPeriod=styleValue(22).x;
+    if (stampPeriod>0.0) {
+        // A tiny overlap covers rounding differences at a shared vertex.
+        if ((lineCoord.x<-.002 && waveEnds.x<.5) ||
+            (lineCoord.x>segmentLength+.002 && waveEnds.y<.5)) discard;
+        float phase=mix(chainSpan.x,chainSpan.y,lineCoord.x/max(segmentLength,1e-5));
+        float side=chainSpan.x<=chainSpan.y?1.0:-1.0;
+        coverage*=stampCoverage(phase,lineCoord.y*side,2.0*radius,stampPeriod);
+    }
     fragColor=vec4(color,opacity*coverage);
 }
 '''
@@ -980,7 +1199,7 @@ def _resources():
     interface.flat('VEC4','screenEnds');interface.flat('VEC3','chainSpan')
     interface.flat('VEC2','endExtension')
     interface.flat('VEC4','normalSpans');interface.flat('FLOAT','normalSide');interface.flat('FLOAT','normalBaseSide')
-    interface.flat('FLOAT','waveSide');interface.flat('VEC2','waveEnds')
+    interface.flat('FLOAT','waveSide');interface.flat('VEC2','waveEnds');interface.flat('VEC2','waveCorners')
     interface.flat('VEC4','normalDepthPlanes')
     interface.flat('VEC2','objectOutside')
     interface.flat('VEC2','objectDepthGradient')
@@ -989,7 +1208,7 @@ def _resources():
     info.sampler(0, 'FLOAT_2D', 'edgeData')
     info.sampler(1, 'FLOAT_2D', 'extraNormals')
     info.sampler(2, 'FLOAT_2D', 'styleData')
-    for slot,name in enumerate(('curveData','chainData','colorImage','sizeImage','coordinateData','sceneDepth','objectDepth','visibilityData','jointData'),3):info.sampler(slot,'FLOAT_2D',name)
+    for slot,name in enumerate(('curveData','chainData','colorImage','sizeImage','coordinateData','sceneDepth','objectDepth','visibilityData','jointData','waveMask'),3):info.sampler(slot,'FLOAT_2D',name)
     info.typedef_source('''
 #define viewportSize viewportInfo.xy
 #define lineWidth viewportInfo.z
@@ -1056,9 +1275,11 @@ def _draw():
     try:
         _resources()
         view=context.region_data; inverse=view.view_matrix.inverted()
-        from . import gpu_depth,gpu_chain
+        from . import gpu_depth,gpu_chain,gpu_preview_cache,gpu_styles
         size = (context.region.width, context.region.height)
-        area_id = context.area.as_pointer()
+        # These buffers are drawn afresh for each region. Reuse one set even
+        # when a user opens and closes multiple View3D areas.
+        area_id = 0
         depth_texture=gpu_depth.draw(entry['depth'],view,size,area_id) if entry.get('depth') else None
         if depth_texture is None:
             if 'dummy_depth' not in entry:entry['dummy_depth']=gpu.types.GPUTexture((1,1),format='R32F',data=gpu.types.Buffer('FLOAT',1,[1.]))
@@ -1074,14 +1295,36 @@ def _draw():
         _shader.uniform_sampler('sceneDepth',depth_texture)
         _shader.uniform_sampler('objectDepth',depth_texture)
         last_object_depth = None
-        for group in entry['groups']:
-            if not len(group['records']):continue
+        culled = _offscreen_groups(entry['viewport_bounds'], view.perspective_matrix, size)
+        entry['groups_culled'] = len(culled)
+        visible = [(index, group) for index, group in enumerate(entry['groups'])
+                   if index not in culled and len(group['records'])]
+        keys = {index for index, _ in visible}
+        keys.update(('depth', id(group['object_depth'])) for _, group in visible
+                    if group['object_depth'] is not None and 'source' not in group['object_depth'])
+        cache = entry['buffer_cache']
+        cache.begin(keys, scene.lea_line.preview_cache_mib * gpu_preview_cache.MIB)
+        scene_depth = entry['depth']
+        entry['scene_depth_bytes'] = (scene_depth['vertices'].nbytes + scene_depth['triangles'].nbytes
+                                      + 4*size[0]*size[1]*(1+bool(entry['object_areas'])))
+        for index, group in visible:
             if group['object_depth'] is not None and group['object_depth'] is not last_object_depth:
+                mesh = group['object_depth']
+                retained = 'source' in mesh or cache.retain(
+                    ('depth', id(mesh)), mesh['vertices'].nbytes + mesh['triangles'].nbytes,
+                    gpu_preview_cache.release_depth, mesh)
                 object_depth = _object_depth(group, view, size, area_id)
+                if not retained:
+                    gpu_preview_cache.release_depth(mesh)
                 _shader.bind()
                 _shader.uniform_sampler('objectDepth', object_depth)
-                last_object_depth = group['object_depth']
+                last_object_depth = mesh
+            if 'cache_bytes' not in group:
+                group['cache_bytes'] = gpu_preview_cache.stroke_bytes(group)
+            retained = cache.retain(index, group['cache_bytes'], gpu_preview_cache.release_stroke, group)
             if group['texture'] is None:_texture(group);entry['uploads']+=1
+            elif group['wave_revision'] != group['style']['wave_revision']:
+                gpu_styles.upload_params(group)
             viewport=(*size,group['width'],int(view.is_perspective))
             visibility=None
             normal_data=None
@@ -1100,9 +1343,13 @@ def _draw():
             if normal_data is None:normal_data=visibility if visibility is not None else group['chain_texture']
             _shader.uniform_sampler('visibilityData',normal_data)
             _shader.uniform_sampler('jointData',group.get('joint_texture',group['chain_texture']))
-            _shader.uniform_float('directionInfo',(*direction,float(visibility is not None)))
+            wave_mask = group.get('chain_views',{}).get(area_id,{}).get('wave_mask')
+            _shader.uniform_sampler('waveMask', wave_mask if wave_mask is not None else group['chain_texture'])
+            _shader.uniform_float('directionInfo',(*direction,2. if wave_mask is not None else float(visibility is not None)))
             _shader.uniform_float('viewportInfo',viewport)
             _batch.draw_instanced(_shader, instance_count=len(group['records'])*(2 if group['style']['params'][17,3] else 1))
+            if not retained:
+                gpu_preview_cache.release_stroke(group)
         entry['draws']+=1;entry['draw_ms']=(time.perf_counter()-start)*1000
     except Exception as exc:
         entry['error']=str(exc);scene.lea_line.last_message='GPU 미리보기 실패: '+str(exc)
