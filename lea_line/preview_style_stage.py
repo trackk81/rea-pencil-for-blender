@@ -1,6 +1,7 @@
 """Detached copies of post-Line-Art style graphs for atomic mixed updates."""
 import uuid
 import bpy
+from .blender_compat import grease_pencil_data
 from . import preview_stroke as stroke
 
 
@@ -19,7 +20,7 @@ def prepare(preview,payload):
           'enabled':bool(payload.get('needed',True))}
     if not plan['enabled']:return plan
     token=plan['old_owner'] or uuid.uuid4().hex;plan['token']=token
-    data=bpy.data.grease_pencils_v3.new('.rea detached style staging')
+    data=grease_pencil_data().new('.rea detached style staging')
     obj=bpy.data.objects.new('.rea detached style staging',data);obj[stroke.OWNER]=token
     detached=None
     try:
@@ -33,7 +34,7 @@ def prepare(preview,payload):
         return plan
     finally:
         graphs=[m.node_group for m in obj.modifiers if m.type=='NODES' and m.node_group]
-        bpy.data.objects.remove(obj,do_unlink=True);bpy.data.grease_pencils_v3.remove(data)
+        bpy.data.objects.remove(obj,do_unlink=True);grease_pencil_data().remove(data)
         for graph in graphs:
             if graph.users==0:bpy.data.node_groups.remove(graph)
 

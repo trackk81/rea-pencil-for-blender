@@ -12,6 +12,45 @@ struct Style {
     radius: f32,
     aa: f32,
     rgba: [f32; 4],
+    max_stroke_size: f32,
+}
+
+#[repr(C)]
+struct ReductionInput {
+    range_factor: Vec3,
+    enabled: u32,
+    reference: Vec3,
+    curve: *const f32,
+}
+
+struct Reduction {
+    range_factor: Vec3,
+    reference: Vec3,
+    curve: Option<Vec<f32>>,
+}
+
+impl Reduction {
+    fn factor(&self, point: Vec3) -> f32 {
+        let [near, far, factor] = self.range_factor;
+        let delta = minus(point, self.reference);
+        let t = ((dot(delta, delta).sqrt() - near) / (far - near).max(1e-6)).clamp(0., 1.);
+        if let Some(curve) = &self.curve {
+            sample_curve(curve, t)
+        } else {
+            1. + (factor - 1.) * t
+        }
+    }
+
+    fn max_factor(&self) -> f32 {
+        if self.curve.is_some() { 1. } else { self.range_factor[2].max(1.) }
+    }
+}
+
+fn sample_curve(curve: &[f32], t: f32) -> f32 {
+    let sample = t.clamp(0., 1.) * 4096.;
+    let i = sample as usize;
+    let f = sample - i as f32;
+    curve[i] * (1. - f) + curve[(i + 1).min(4096)] * f
 }
 
 #[repr(C)]
@@ -26,6 +65,8 @@ pub struct StyleInput {
     stamp_width: usize,
     stamp_height: usize,
     stamp_period: f32,
+    reduction: [ReductionInput; 2],
+    stroke_curves: [*const f32; 2],
 }
 
 #[repr(C)]
@@ -51,6 +92,7 @@ pub struct Mesh {
     style_ids: *const u32,
     style_count: usize,
     marks: *const u8,
+    world: [[f32; 4]; 3],
 }
 
 pub struct Frame {
@@ -58,6 +100,8 @@ pub struct Frame {
     height: usize,
     styles: Vec<Style>,
     stamps: Vec<Option<Stamp>>,
+    reductions: Vec<[Option<Reduction>; 2]>,
+    stroke_curves: Vec<[Option<Vec<f32>>; 2]>,
     // A single ordered atomic couples nonnegative depth bits to the winning
     // object's ID. Equal depths choose the smaller ID on every worker count.
     depth: Vec<AtomicU64>,
@@ -75,6 +119,7 @@ struct Stroke {
 pub struct Ink {
     strokes: Vec<Vec<Stroke>>,
     stamp_spans: Vec<Vec<StampSpan>>,
+    reduction_points: Vec<Vec<[Clip; 2]>>,
 }
 
 struct Stamp {
@@ -108,6 +153,7 @@ struct StampSpan {
     start: f32,
     end: f32,
     caps: [bool; 2],
+    total: f32,
 }
 
 const CUT_VERTEX: u32 = u32::MAX;
@@ -131,9 +177,11 @@ fn stamp_spans(lines: &[Stroke], endpoints: &[[u32; 2]], vertex_count: usize) ->
         let [first, second] = links[vertex as usize];
         if second >= BRANCH { NONE } else if first == half { second } else { first }
     };
-    let empty = StampSpan {start:f32::NAN,end:0.0,caps:[true;2]};
+    let empty = StampSpan {start:f32::NAN,end:0.0,caps:[true;2],total:0.};
     let mut spans = vec![empty; lines.len()];
+    let mut chain = Vec::new();
     let mut walk = |mut half: usize| {
+        chain.clear();
         let mut distance = 0.0;
         while half != NONE {
             let edge = half/2;
@@ -144,11 +192,13 @@ fn stamp_spans(lines: &[Stroke], endpoints: &[[u32; 2]], vertex_count: usize) ->
             let delta = minus(lines[edge].b,lines[edge].a);
             let length = (delta[0]*delta[0]+delta[1]*delta[1]).sqrt();
             let end = distance+length;
-            spans[edge] = if side==0 { StampSpan {start:distance,end,caps} }
-                          else { StampSpan {start:end,end:distance,caps} };
+            spans[edge] = if side==0 { StampSpan {start:distance,end,caps,total:0.} }
+                          else { StampSpan {start:end,end:distance,caps,total:0.} };
+            chain.push(edge);
             distance = end;
             half = neighbor(endpoints[edge][1-side],2*edge+1-side);
         }
+        for &edge in &chain { spans[edge].total = distance; }
     };
     // Open strokes start at the lower terminal vertex, matching the GPU's
     // default orientation. A branch is a terminal for each of its edges.
@@ -363,8 +413,12 @@ impl Frame {
         low*(1.0-fy)+high*fy+DEPTH_BIAS
     }
 
-    fn stroke(&self, line: Stroke, style: Style, rect: [usize; 4], output: &mut [[f32; 4]],
-              texture: Option<(&Stamp, StampSpan)>) {
+    fn stroke(&self, line: Stroke, index: usize, rect: [usize; 4], output: &mut [[f32; 4]],
+              span: Option<&StampSpan>, world: Option<&[Clip; 2]>) {
+        let style = self.styles[index];
+        let reduction = &self.reductions[index];
+        let profiles = &self.stroke_curves[index];
+        let stamp = self.stamps[index].as_ref();
         let [left,bottom,right,top] = rect;
         let a = line.a;
         let d = minus(line.b, a);
@@ -373,17 +427,18 @@ impl Frame {
         let inv_length = length_sq.sqrt().recip();
         let outward = [-d[1]*inv_length*line.outside,d[0]*inv_length*line.outside];
         let aa = style.aa.min(1.0);
-        let reach = style.radius+aa*0.5;
+        let max_radius = style.radius * style.max_stroke_size * reduction[0].as_ref().map_or(1., Reduction::max_factor);
+        let reach = max_radius+aa*0.5;
         let axis = usize::from(d[0].abs() < d[1].abs());
         let cross = 1-axis;
         let lower = [left,bottom];
         let upper = [right,top];
         let width = right-left;
-        let span = range(a[axis].min(line.b[axis])-reach,a[axis].max(line.b[axis])+reach,upper[axis]);
+        let scan_range = range(a[axis].min(line.b[axis])-reach,a[axis].max(line.b[axis])+reach,upper[axis]);
         let perpendicular_reach = reach/(d[axis].abs()*inv_length);
         let inv_d = d[axis].recip();
         let inv_len_sq = length_sq.recip();
-        for i in span.start.max(lower[axis])..span.end {
+        for i in scan_range.start.max(lower[axis])..scan_range.end {
             let scan = i as f32+0.5-a[axis];
             let middle = a[cross]+(scan*inv_d).clamp(0.0,1.0)*d[cross];
             let cross_span = range(middle-perpendicular_reach,middle+perpendicular_reach,upper[cross]);
@@ -408,15 +463,32 @@ impl Frame {
                         continue;
                     }
                 }
+                let mut radius = style.radius;
+                let mut opacity = style.rgba[3];
+                if let Some([wa, wb]) = world {
+                    let u = t * wb[3] / ((1. - t) * wa[3] + t * wb[3]).max(1e-20);
+                    let point = std::array::from_fn(|i| wa[i] + (wb[i] - wa[i]) * u);
+                    if let Some(size) = &reduction[0] { radius *= size.factor(point); }
+                    if let Some(alpha) = &reduction[1] { opacity *= alpha.factor(point); }
+                }
+                if let Some(span) = span {
+                    let along = span.start + t * (span.end - span.start);
+                    let parameter = along / span.total.max(1e-5);
+                    if let Some(size) = &profiles[0] { radius *= sample_curve(size, parameter); }
+                    if let Some(alpha) = &profiles[1] { opacity *= sample_curve(alpha, parameter); }
+                }
+                if radius <= 0. || opacity <= 0. || distance_sq >= (radius + aa*0.5).powi(2) {
+                    continue;
+                }
                 let coverage = if aa == 0.0 { 1.0 }
-                    else { (0.5+(style.radius-distance_sq.sqrt())/aa).clamp(0.0,1.0) };
+                    else { (0.5+(radius-distance_sq.sqrt())/aa).clamp(0.0,1.0) };
                 let (x,y) = if axis == 0 {(i,j)} else {(j,i)};
-                let mut alpha = coverage*style.rgba[3];
-                if let Some((stamp, span)) = texture {
+                let mut alpha = coverage*opacity;
+                if let (Some(stamp), Some(span)) = (stamp, span) {
                     if (projected<0.0 && !span.caps[0]) || (projected>=1.0 && !span.caps[1]) { continue; }
                     let across = (-d[1]*(x as f32+0.5-a[0])+d[0]*(y as f32+0.5-a[1]))*inv_length;
                     let side = if span.start <= span.end {1.0} else {-1.0};
-                    alpha *= stamp.sample(span.start+projected*(span.end-span.start), across*side, 2.0*style.radius);
+                    alpha *= stamp.sample(span.start+projected*(span.end-span.start), across*side, 2.0*radius);
                     if alpha <= 0.0 { continue; }
                 }
                 let pixel = &mut output[(y-bottom)*width+x-left];
@@ -445,7 +517,7 @@ mod outline_tests {
             let owner=if i==0 {1u32} else {2u32};
             AtomicU64::new(((0.7f32.to_bits() as u64)<<32)|owner as u64)
         }).collect();
-        let frame=Frame {width:4,height:4,styles:vec![],stamps:vec![],depth};
+        let frame=Frame {width:4,height:4,styles:vec![],stamps:vec![],reductions:vec![],stroke_curves:vec![],depth};
         let samples=|outward| {
             [0.,1./3.,2./3.,1.].map(|t| {
                 let point=[0.6+0.3*t,0.6+0.3*t,0.4+0.2*t];
@@ -509,7 +581,8 @@ unsafe fn prepare(frame: &Frame, mesh: &Mesh) -> Option<Ink> {
         }
     }
     let mut ink = Ink {strokes:vec![Vec::new();frame.styles.len()],
-                       stamp_spans:vec![Vec::new();frame.styles.len()]};
+                       stamp_spans:vec![Vec::new();frame.styles.len()],
+                       reduction_points:vec![Vec::new();frame.styles.len()]};
     if jobs.is_empty() { return Some(ink); }
     let edges = slice::from_raw_parts(mesh.edges,mesh.edge_count);
     let marks = (!mesh.marks.is_null()).then(|| slice::from_raw_parts(mesh.marks,mesh.edge_count));
@@ -574,9 +647,10 @@ unsafe fn prepare(frame: &Frame, mesh: &Mesh) -> Option<Ink> {
         let marked = second.is_some() && marks.is_some_and(|values| values[index]!=0);
         for &job in jobs {
             let style = frame.styles[job as usize];
-            let textured = frame.stamps[job as usize].is_some();
+            let chained = frame.stamps[job as usize].is_some()
+                || frame.stroke_curves[job as usize].iter().any(Option::is_some);
             // Offscreen strokes can still contribute to a texture's phase.
-            if outside_frame != 0 && !textured { continue; }
+            if outside_frame != 0 && !chained { continue; }
             let contour = silhouette && style.flags&OUTLINE != 0;
             let boundary = second.is_none() && style.flags&BORDER != 0;
             let mark = marked && style.flags&MARK != 0
@@ -590,21 +664,43 @@ unsafe fn prepare(frame: &Frame, mesh: &Mesh) -> Option<Ink> {
                 if front_face.unwrap().forward {-mesh.handedness} else {mesh.handedness}
             } else { 0.0 };
             let (mut p,mut q) = (projected[a],projected[b]);
+            let variable = frame.reductions[job as usize].iter().any(Option::is_some);
+            let mut world = [[0.; 4]; 2];
+            if variable {
+                for (end, vertex) in [a,b].into_iter().enumerate() {
+                    for i in 0..3 {
+                        let row = mesh.world[i];
+                        world[end][i] = dot([row[0],row[1],row[2]], vertices[vertex]) + row[3];
+                    }
+                }
+            }
+            let (mut left,mut right) = (clips[a],clips[b]);
             if (codes[a]|codes[b])&48 != 0 {
-                let (mut left,mut right) = (clips[a],clips[b]);
                 for sign in [1.0,-1.0] {
                     let d0 = left[3]+left[2]*sign;
                     let d1 = right[3]+right[2]*sign;
-                    if d0 < 0.0 { left = lerp(left,right,d0/(d0-d1)); }
-                    else if d1 < 0.0 { right = lerp(right,left,d1/(d1-d0)); }
+                    if d0 < 0.0 {
+                        let t = d0/(d0-d1);
+                        left = lerp(left,right,t);
+                        if variable { world[0] = lerp(world[0],world[1],t); }
+                    } else if d1 < 0.0 {
+                        let t = d1/(d1-d0);
+                        right = lerp(right,left,t);
+                        if variable { world[1] = lerp(world[1],world[0],t); }
+                    }
                 }
                 p = screen(left,size);
                 q = screen(right,size);
             }
-            if textured && (p[0]-q[0]).hypot(p[1]-q[1]) < 1e-5 { continue; }
+            if chained && (p[0]-q[0]).hypot(p[1]-q[1]) < 1e-5 { continue; }
+            if variable {
+                world[0][3] = left[3].recip();
+                world[1][3] = right[3].recip();
+                ink.reduction_points[job as usize].push(world);
+            }
             ink.strokes[job as usize].push(Stroke {a:p,b:q,outside,owner:mesh.owner,
                 exterior_only:contour && !boundary && !crease && !mark});
-            if textured {
+            if chained {
                 stamp_edges[job as usize].push([
                     if codes[a]&48==0 {a as u32} else {CUT_VERTEX},
                     if codes[b]&48==0 {b as u32} else {CUT_VERTEX},
@@ -645,7 +741,7 @@ fn has_crease(first: Incident, second: Incident, extra_start: u32, extra: &[(u32
 }
 
 #[no_mangle]
-pub extern "C" fn rea_cpu_lines_abi_version() -> u32 { 2 }
+pub extern "C" fn rea_cpu_lines_abi_version() -> u32 { 3 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rea_cpu_lines_create(
@@ -659,6 +755,8 @@ pub unsafe extern "C" fn rea_cpu_lines_create(
         depth.resize_with(pixels,|| AtomicU64::new(EMPTY));
         let mut resolved = Vec::with_capacity(count);
         let mut stamps = Vec::with_capacity(count);
+        let mut reductions = Vec::with_capacity(count);
+        let mut stroke_curves = Vec::with_capacity(count);
         for style in slice::from_raw_parts(styles,count) {
             let stamp = if style.stamp.is_null() { None } else {
                 let Some(size) = style.stamp_width.checked_mul(style.stamp_height) else { return ptr::null_mut(); };
@@ -668,11 +766,25 @@ pub unsafe extern "C" fn rea_cpu_lines_create(
                 Some(Stamp {coverage:slice::from_raw_parts(style.stamp,size).to_vec(),
                             width:style.stamp_width,height:style.stamp_height,period:style.stamp_period})
             };
+            let profiles = style.stroke_curves.map(|curve| (!curve.is_null())
+                .then(|| slice::from_raw_parts(curve,4097).to_vec()));
+            let max_stroke_size = profiles[0].as_ref()
+                .map_or(1., |curve| curve.iter().copied().fold(1., f32::max));
+            stroke_curves.push(profiles);
             resolved.push(Style {flags:style.flags,min_cos:style.min_cos,max_cos:style.max_cos,
-                                 radius:style.radius,aa:style.aa,rgba:style.rgba});
+                                 radius:style.radius,aa:style.aa,rgba:style.rgba,max_stroke_size});
             stamps.push(stamp);
+            reductions.push(std::array::from_fn(|index| {
+                let input = &style.reduction[index];
+                (input.enabled != 0).then(|| Reduction {
+                    range_factor: input.range_factor,
+                    reference: input.reference,
+                    curve: (!input.curve.is_null())
+                        .then(|| slice::from_raw_parts(input.curve,4097).to_vec()),
+                })
+            }));
         }
-        Box::into_raw(Box::new(Frame {width,height,styles:resolved,stamps,depth}))
+        Box::into_raw(Box::new(Frame {width,height,styles:resolved,stamps,reductions,stroke_curves,depth}))
     }).unwrap_or(ptr::null_mut())
 }
 
@@ -698,19 +810,15 @@ pub unsafe extern "C" fn rea_cpu_lines_draw(
         let pixels = slice::from_raw_parts_mut(output,(x1-x0)*(y1-y0));
         pixels.fill([0.0;4]);
         let mut strokes = 0;
-        for (index,&style) in frame.styles.iter().enumerate() {
+        for index in 0..frame.styles.len() {
             for &part in parts {
                 let part = &*part;
                 let ink = &part.strokes[index];
                 strokes += ink.len();
-                if let Some(stamp) = &frame.stamps[index] {
-                    for (&stroke, &span) in ink.iter().zip(&part.stamp_spans[index]) {
-                        frame.stroke(stroke,style,rect,pixels,Some((stamp,span)));
-                    }
-                } else {
-                    for &stroke in ink {
-                        frame.stroke(stroke,style,rect,pixels,None);
-                    }
+                let points = &part.reduction_points[index];
+                let spans = &part.stamp_spans[index];
+                for (i, &stroke) in ink.iter().enumerate() {
+                    frame.stroke(stroke,index,rect,pixels,spans.get(i),points.get(i));
                 }
             }
         }

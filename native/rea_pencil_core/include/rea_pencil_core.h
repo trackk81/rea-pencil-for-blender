@@ -52,14 +52,22 @@ int32_t rea_edge_owners_v1(const rea_edge_owners_input_v1 *input,
  */
 typedef struct rea_cpu_frame rea_cpu_frame;
 typedef struct rea_cpu_ink rea_cpu_ink;
-typedef struct rea_cpu_style_v2 {
+typedef struct rea_cpu_reduction_v3 {
+    float range_factor[3]; /* Near, far, far factor. */
+    uint32_t enabled;
+    float reference[3];
+    const float *curve; /* Optional 4097-sample table. Copied at create. */
+} rea_cpu_reduction_v3;
+typedef struct rea_cpu_style_v3 {
     uint32_t flags; /* 1 outline, 2 border, 4 crease, 8 reserve outline, 16 marked, 32 exclude marked */
     float min_cos, max_cos, radius, aa, rgba[4];
     const float *stamp; /* Optional tightly packed row-major coverage. Copied at create. */
     size_t stamp_width, stamp_height;
     float stamp_period;
-} rea_cpu_style_v2;
-typedef struct rea_cpu_mesh_v2 {
+    rea_cpu_reduction_v3 reduction[2]; /* Size, alpha. */
+    const float *stroke_curves[2]; /* Optional 4097 samples, copied at create. */
+} rea_cpu_style_v3;
+typedef struct rea_cpu_mesh_v3 {
     const float (*vertices)[3];
     size_t vertex_count;
     const uint32_t (*triangles)[3];
@@ -78,11 +86,12 @@ typedef struct rea_cpu_mesh_v2 {
     const uint32_t *style_ids;
     size_t style_count;
     const uint8_t *marks; /* Optional per-edge Freestyle selection marks. */
-} rea_cpu_mesh_v2;
+    float world[3][4];
+} rea_cpu_mesh_v3;
 uint32_t rea_cpu_lines_abi_version(void);
 rea_cpu_frame *rea_cpu_lines_create(size_t width, size_t height,
-    const rea_cpu_style_v2 *styles, size_t count);
-rea_cpu_ink *rea_cpu_lines_prepare(const rea_cpu_frame *frame, const rea_cpu_mesh_v2 *mesh);
+    const rea_cpu_style_v3 *styles, size_t count);
+rea_cpu_ink *rea_cpu_lines_prepare(const rea_cpu_frame *frame, const rea_cpu_mesh_v3 *mesh);
 size_t rea_cpu_lines_draw(const rea_cpu_frame *frame, const rea_cpu_ink *const *parts,
     size_t count, const size_t (*rect)[4], float (*output)[4]);
 void rea_cpu_lines_free(rea_cpu_frame *frame);

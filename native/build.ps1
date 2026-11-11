@@ -39,7 +39,7 @@ $buildInfo = [ordered]@{
         'src/cpu_lines.rs' = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'rea_pencil_core/src/cpu_lines.rs') -Algorithm SHA256).Hash.ToLowerInvariant()
         'include/rea_pencil_core.h' = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'rea_pencil_core/include/rea_pencil_core.h') -Algorithm SHA256).Hash.ToLowerInvariant()
     }
-    cpu_lines_abi_version = 2
+    cpu_lines_abi_version = 3
     optional_exports = @('rea_edge_owners_abi_version', 'rea_edge_owners_v1',
         'rea_cpu_lines_abi_version', 'rea_cpu_lines_create', 'rea_cpu_lines_prepare',
         'rea_cpu_lines_draw', 'rea_cpu_lines_free', 'rea_cpu_lines_free_mesh')

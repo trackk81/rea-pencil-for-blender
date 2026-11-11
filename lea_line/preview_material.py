@@ -7,6 +7,7 @@ the last valid output. All Blender work runs on the main thread.
 """
 import uuid
 import bpy
+from .blender_compat import grease_pencil_data
 import numpy as np
 from bpy.app.handlers import persistent
 from . import material_scope, native_core
@@ -193,7 +194,7 @@ def _remove_private(token):
         if _valid(scene):
             bpy.data.scenes.remove(scene)
     orphans = []
-    for collection in (bpy.data.meshes, bpy.data.cameras, bpy.data.grease_pencils_v3):
+    for collection in (bpy.data.meshes, bpy.data.cameras, grease_pencil_data()):
         for block in list(collection):
             if _owned(block, token) and block.users == 0:
                 orphans.append(block)
@@ -202,7 +203,7 @@ def _remove_private(token):
 
 
 def _empty_data(preview, scene):
-    data = bpy.data.grease_pencils_v3.new('.rea material empty Line Art base')
+    data = grease_pencil_data().new('.rea material empty Line Art base')
     data['rea_pencil_preview'] = True
     data['rea_pencil_preview_owner'] = preview.get('rea_pencil_preview_owner')
     data['rea_pencil_preview_schema'] = 1
@@ -217,7 +218,7 @@ def _empty_data(preview, scene):
 def _remove_output(data):
     if (_valid(data) and data.users == 0 and data.get('rea_pencil_preview')
             and not any(stage['snapshot'] == data for stage in _stages.values())):
-        bpy.data.grease_pencils_v3.remove(data)
+        grease_pencil_data().remove(data)
 
 
 def _matrix(value):
@@ -274,7 +275,7 @@ class _Entry:
         self.scene.camera = self.camera
         # Never copy a LineArt Object (Blender 4.4 copy_data crashes), and never
         # copy a nonempty live snapshot into the evaluation base.
-        data = _tag(bpy.data.grease_pencils_v3.new('.rea private empty ink'), self.token, self.source_token)
+        data = _tag(grease_pencil_data().new('.rea private empty ink'), self.token, self.source_token)
         layer = data.layers.new('Lines', set_active=True)
         layer.use_lights = False
         layer.frames.new(source.frame_current)
@@ -509,7 +510,7 @@ def sync(scene, node, preview):
                 result['changed'], result['writes'] = True, result['writes'] + 1
             except Exception as exc:
                 if snapshot is not None and _valid(snapshot) and snapshot.users == 0:
-                    bpy.data.grease_pencils_v3.remove(snapshot)
+                    grease_pencil_data().remove(snapshot)
                 entry.dirty = True
                 entry.close_private()
                 _count(scene, 'failures')

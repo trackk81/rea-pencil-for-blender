@@ -4,15 +4,15 @@
   "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
   "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "crt_linkage": "static",
-  "dll_sha256": "04a6998a78553eeed3dd28ddd2045d8f656699e0674bb6b213cf07a445e85d70",
+  "dll_sha256": "37132aeb36682e5b5190170f3bc802eff046bfdc09146537840c12a0558c9f34",
   "rust_source_sha256": "35e71cc3221684228437a45179499f2a4d53c20b0cdf68e54e90e11d5b49b337",
   "rust_source_files_sha256": {
     "src/lib.rs": "35e71cc3221684228437a45179499f2a4d53c20b0cdf68e54e90e11d5b49b337",
     "src/ownership.rs": "7b2592396efd152d53c35b7a7ee33bf9d2c0f679cd80c3d434a1c240e531112b",
-    "src/cpu_lines.rs": "23fd7e846a09c84cba33fbb55b108e1a29ecd9993776110ff4beb01928c0f73a",
-    "include/rea_pencil_core.h": "a72acddbde4359a3c04fb88680063bb539e41704993ba4b034814398c1b84f71"
+    "src/cpu_lines.rs": "19b39e871d1019199b7738238e460d04fd08a1e40568b9489f1eeeac6a4b2df1",
+    "include/rea_pencil_core.h": "71d7ee41c36af2d4401d7966174f5459f1afe8718b7019c55284fb5be4cddf69"
   },
-  "cpu_lines_abi_version": 2,
+  "cpu_lines_abi_version": 3,
   "optional_exports": [
     "rea_edge_owners_abi_version",
     "rea_edge_owners_v1",

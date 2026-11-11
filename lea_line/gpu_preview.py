@@ -1287,7 +1287,7 @@ def _draw():
     if not entry or entry['error'] or bpy.app.is_job_running('RENDER'):return
     shading=context.space_data.shading
     if shading.type not in {'SOLID','MATERIAL','RENDERED'}:return
-    if shading.type=='RENDERED' and scene.render.engine not in {'BLENDER_EEVEE_NEXT','CYCLES'}:return
+    if shading.type=='RENDERED' and scene.render.engine not in {'BLENDER_EEVEE','BLENDER_EEVEE_NEXT','CYCLES'}:return
     if shading.type=='SOLID' and shading.show_xray:return
     # Always use the current region's matrices, including during navigation,
     # after leaving camera view, and in additional View3D areas. No helper is

@@ -1,3 +1,13 @@
+## 0.28.19 — CPU Stroke Size·Alpha Reduction
+
+- CPU 라인 렌더에서 Brush Detail의 **Stroke Size Reduction Settings**와 **Stroke Alpha Reduction Settings**를 각각 또는 함께 적용할 수 있습니다. 저장된 설정을 유지한 도쿄 장면에서 Size 단독 및 Size·Alpha 조합을 렌더했습니다.
+- CPU 라인 렌더에서 카메라 또는 기준 오브젝트를 사용하는 거리별 Size·Alpha Reduction도 지원합니다. 선형 감소와 Reduction Curve를 확인했습니다.
+- Blender 5.2.4에서 REA 노드 트리가 남은 상태로 애드온을 다시 켤 때 발생하는 충돌을 수정했습니다. 기본 GPU 미리보기, EEVEE Rendered 미리보기와 Native 전환을 확인했습니다.
+
+CPU 감소 기능은 Blender 4.4, 4.5.9, 5.2.4에서 라인 전용 렌더로 검증했습니다. 스트로크 곡선과 방향 지정·각도 분할 조합, CPU Wave는 지원 범위 밖입니다. Blender 5.2의 복합 Native 브러시·재질과 F12 장면 합성은 추가 검증이 필요합니다. 원본 Pencil+와 연결부·AA에는 차이가 남아 있습니다.
+
+기존 설치에서는 **업데이트 확인 → 새 버전 다운로드** 후 Blender를 다시 시작하세요.
+
 ## 0.28.18 — Blender 4.5 미리보기 복구
 
 - Blender 4.5에서 미리보기가 4.4 전용 검사에 막히던 문제를 수정했습니다. Blender 4.4와 4.5를 허용합니다.

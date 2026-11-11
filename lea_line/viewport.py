@@ -7,6 +7,7 @@ import uuid
 import math
 
 import bpy
+from .blender_compat import grease_pencil_data
 
 from . import free_view
 from . import backend, routing, material_scope, preview_camera, preview_stroke, preview_material
@@ -90,7 +91,7 @@ def _remove_object(scene, obj):
     preview_texture.cleanup(obj)
     bpy.data.objects.remove(obj, do_unlink=True)
     if data and data.users == 0 and data.get(TAG):
-        bpy.data.grease_pencils_v3.remove(data)
+        grease_pencil_data().remove(data)
 
 
 def clear_preview(scene, *, keep_free_view=False):
@@ -125,7 +126,7 @@ def _material(owner, key):
 def _object(scene, owner, key):
     obj = next((obj for obj in scene.objects if _owned(obj, owner) and obj.get(KEY) == key), None)
     if obj is None:
-        data = bpy.data.grease_pencils_v3.new("rea pencil preview strokes")
+        data = grease_pencil_data().new("rea pencil preview strokes")
         data[TAG] = True
         data[OWNER] = owner
         data[SCHEMA_KEY] = SCHEMA_VERSION
@@ -172,8 +173,8 @@ def sync_preview(scene, material_render=False):
         # Creating a private Scene/camera in that interval can crash its window
         # scene synchronization before the corresponding post handler runs.
         return ['Live preview refresh is deferred during Blender scene restoration.']
-    if bpy.app.version[:2] not in {(4, 4), (4, 5)}:
-        raise ValueError("미리보기는 Blender 4.4 및 4.5에서 지원합니다")
+    if bpy.app.version[:2] not in {(4, 4), (4, 5), (5, 2)}:
+        raise ValueError("미리보기는 Blender 4.4, 4.5 및 5.2에서 지원합니다")
     tree = scene.lea_line.tree
     if tree is None:
         clear_preview(scene)
@@ -319,12 +320,17 @@ def sync_preview(scene, material_render=False):
                 "level_start": 0 if visibility == "VISIBLE" else 1,
                 "level_end": 0 if visibility == "VISIBLE" else 128,
                 "opacity": 1. if stamp_layer_alpha else selected_brush.alpha,
-                "thickness": max(1, min(200, round(width))),
                 "overscan": 1. if free_view.dimensions(scene) else 0.,
                 "use_cache": False,  # Independent sets have independent filters.
                 "show_viewport": not material_live,
                 "show_render": not material_live,  # Object is excluded from final renders.
             }
+            thickness = max(1, min(200, round(width)))
+            if hasattr(modifier, 'thickness'):
+                geometry['thickness'] = thickness
+            else:
+                # Blender converts saved Line Art thickness to world radius.
+                geometry['radius'] = thickness / 2000.0
             for name, value in geometry.items():
                 _set(modifier, name, value)
             if material_live:

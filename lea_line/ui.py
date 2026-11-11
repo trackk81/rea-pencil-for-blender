@@ -234,10 +234,10 @@ class LEALineTree(bpy.types.NodeTree):
         return None, None, None
 
     def update(self):
-        # Blender may notify an existing tree while removing its custom RNA
-        # type during add-on disable/re-enable.
-        if (not hasattr(self, 'nodes') or not hasattr(bpy.data, 'scenes')
-                or not hasattr(bpy.types.Scene, 'lea_line')):
+        # Blender can call this while registering sockets for an existing tree.
+        # Check registration before accessing the tree's RNA properties.
+        if (not hasattr(bpy.types.Scene, 'lea_line') or not hasattr(bpy.data, 'scenes')
+                or not hasattr(self, 'nodes')):
             return
         if _sync_busy:
             return

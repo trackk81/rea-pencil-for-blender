@@ -13,11 +13,16 @@ from mathutils import Vector
 from . import backend, gpu_depth, gpu_preview, gpu_styles, native_core, width_profile
 
 
+class _Reduction(Structure):
+    _fields_ = [('range_factor', c_float * 3), ('enabled', c_uint32),
+                ('reference', c_float * 3), ('curve', c_void_p)]
+
+
 class _Style(Structure):
     _fields_ = [('flags', c_uint32), ('min_cos', c_float), ('max_cos', c_float),
                 ('radius', c_float), ('aa', c_float), ('rgba', c_float * 4),
                 ('stamp', c_void_p), ('stamp_width', c_size_t), ('stamp_height', c_size_t),
-                ('stamp_period', c_float)]
+                ('stamp_period', c_float), ('reduction', _Reduction * 2), ('stroke_curves', c_void_p * 2)]
 
 
 class _Mesh(Structure):
@@ -30,6 +35,7 @@ class _Mesh(Structure):
         ('projection', c_float * 16), ('normal', c_float * 9), ('eye', c_float * 3),
         ('perspective', c_uint32), ('handedness', c_float), ('owner', c_uint32),
         ('style_ids', c_void_p), ('style_count', c_size_t), ('marks', c_void_p),
+        ('world', c_float * 12),
     ]
 
 
@@ -40,7 +46,7 @@ def _api():
     except AttributeError as error:
         raise ValueError('CPU 선 렌더용 Rust 모듈이 설치되어 있지 않습니다') from error
     version.argtypes, version.restype = [], c_uint32
-    if version() != 2:
+    if version() != 3:
         raise ValueError('CPU 선 렌더용 Rust 모듈 버전이 호환되지 않습니다')
     signatures = {
         'create': ([c_size_t, c_size_t, POINTER(_Style), c_size_t], c_void_p),
@@ -61,6 +67,9 @@ def snapshot(scene, depsgraph):
     jobs = gpu_preview._jobs(scene)
     styles = []
     coverage = []
+    reduction_curves = []
+    camera_references = []
+    stroke_curves = []
     for node, brush, _ in jobs:
         if (node._gpu_hidden or node._gpu_merge_mode or node.object_edge
                 or any(getattr(node, k) for k in ('material_boundary', 'wireframe',
@@ -69,9 +78,11 @@ def snapshot(scene, depsgraph):
         scale = backend.width_scale(scene, node)
         params = gpu_styles.snapshot(brush, scale, output=node.line_output)
         period = float(params['params'][22,0])
-        if ((brush.brush_type != 'SIMPLE' or params['needs_chain']) and not period or params['maps']
+        unsupported_chain = (gpu_styles.wave_amount(brush) or
+                             any(getattr(brush, key, False) for key in
+                                 ('dashed', 'min_line_length', 'extend', 'normal_offset')))
+        if ((brush.brush_type != 'SIMPLE' or unsupported_chain) and not period or params['maps']
                 or np.any(params['params'][17, :3])
-                or gpu_preview._channel(brush, 'SIZE')[3] or gpu_preview._channel(brush, 'ALPHA')[3]
                 or node.line_output.over_sampling != 1):
             raise ValueError(f'CPU 선 렌더: {node.name}은 기본 Simple 실선·질감 브러시와 오버샘플링 1을 지원합니다')
         outline, border = node.outline, node.border or (node.outline and node.outline_open)
@@ -84,11 +95,33 @@ def snapshot(scene, depsgraph):
         stamp = np.ascontiguousarray(params['images']['size'][:,:,0]) if period else None
         height, columns = stamp.shape if stamp is not None else (0, 0)
         coverage.append(stamp)
+        channels = []
+        from_camera = []
+        for index, kind in enumerate(('SIZE', 'ALPHA')):
+            near, far, factor, enabled = gpu_preview._channel(brush, kind)
+            curve = (np.ascontiguousarray(params['curves'][:,index+2])
+                     if enabled and params['params'][14,index] else None)
+            reduction_curves.append(curve)
+            from_camera.append(bool(enabled and not params['params'][14,index+2]))
+            channels.append(_Reduction((c_float*3)(near, far, factor), int(enabled),
+                                       (c_float*3)(*params['params'][15+index,:3]),
+                                       curve.ctypes.data if curve is not None else None))
+        camera_references.append(from_camera)
+        profiles = [np.ascontiguousarray(params['curves'][:,index])
+                    if params['params'][3,index] else None for index in range(2)]
+        if any(profile is not None for profile in profiles) and (
+                getattr(brush, 'line_direction_enabled', False) or getattr(brush, 'split_angle_enabled', False)):
+            raise ValueError(f'CPU 선 렌더: {node.name}의 스트로크 곡선과 방향 지정·각도 분할 조합은 미지원입니다')
+        stroke_curves.extend(profiles)
         styles.append(_Style(flags, math.cos(node.normal_angle_max)-2e-7,
                              math.cos(node.normal_angle_min)+2e-7, width*0.5,
                              node.line_output.antialiasing, (c_float*4)(*brush.color, brush.alpha),
-                             stamp.ctypes.data if stamp is not None else None, columns, height, period))
-    return {'jobs': jobs, 'styles': (_Style * len(styles))(*styles), 'stamp_coverage': coverage}
+                             stamp.ctypes.data if stamp is not None else None, columns, height, period, (_Reduction*2)(*channels),
+                             (c_void_p*2)(*(profile.ctypes.data if profile is not None else None
+                                            for profile in profiles))))
+    return {'jobs': jobs, 'styles': (_Style * len(styles))(*styles), 'stamp_coverage': coverage,
+            'reduction_curves': reduction_curves, 'camera_references': camera_references,
+            'stroke_curves': stroke_curves}
 
 
 def _array(collection, name, shape, dtype):
@@ -154,7 +187,8 @@ def _packet(instance, owner, projection, world, perspective, jobs):
                    sizes.ctypes.data,normals.ctypes.data,len(sizes),
                    (c_float*16)(*(v for row in clip for v in row)), (c_float*9)(*normal),
                    (c_float*3)(*eye),perspective,handedness,owner,
-                   style_ids.ctypes.data,len(style_ids), marks.ctypes.data if marks is not None else None)
+                   style_ids.ctypes.data,len(style_ids), marks.ctypes.data if marks is not None else None,
+                   (c_float*12)(*(transform[row][col] for row in range(3) for col in range(4))))
     # Keep every ctypes input alive until its worker returns.
     return packet, (vertices, triangles, edges, loop_edges, loop_vertices, sizes, normals, style_ids, marks)
 
@@ -170,7 +204,12 @@ def draw(scene, depsgraph, entry, frame, bounds, *, world=None, shift_x=None):
     if world is None:
         world = camera.matrix_world.normalized()
     projection = _camera_projection(scene, depsgraph, camera, frame, shift_x) @ world.inverted()
-    styles, jobs = entry['styles'], entry['jobs']
+    jobs = entry['jobs']
+    styles = (_Style * len(entry['styles']))(*entry['styles'])
+    for style, references in zip(styles, entry['camera_references']):
+        for reduction, from_camera in zip(style.reduction, references):
+            if from_camera:
+                reduction.reference[:] = world.translation
     context = create(width,height,styles,len(styles))
     if not context:
         raise MemoryError('CPU 선 렌더의 깊이 버퍼를 할당할 수 없습니다')

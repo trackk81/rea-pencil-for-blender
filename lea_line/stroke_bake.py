@@ -6,6 +6,7 @@ viewport graph is only used when its source geometry matches render settings.
 import time
 from contextlib import contextmanager
 import bpy
+from .blender_compat import grease_pencil_data
 
 
 def ineligible_reason(scene):
@@ -111,4 +112,4 @@ def prepared(scene, objects, material_nodes=None):
             for modifier, show_render, show_viewport in flags:
                 modifier.show_render, modifier.show_viewport = show_render, show_viewport
             if copied.users == 0:
-                bpy.data.grease_pencils_v3.remove(copied)
+                grease_pencil_data().remove(copied)
