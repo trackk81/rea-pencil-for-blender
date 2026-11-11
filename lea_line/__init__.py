@@ -3,7 +3,7 @@
 bl_info = {
     "name": "rea pencil for blender",
     "author": "rea pencil contributors",
-    "version": (0, 28, 19),
+    "version": (0, 28, 20),
     "blender": (4, 4, 0),
     "location": "View3D > Sidebar > REA Pencil Line / Node Editor > REA Pencil Line",
     "description": "Node-driven outlines, creases, material boundaries and hidden lines",

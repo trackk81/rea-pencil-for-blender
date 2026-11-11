@@ -7,6 +7,7 @@ Not the Pencil+ rasterizer: joins/stamp coverage and AA remain different.
 import math
 import time
 import bpy
+from .blender_compat import read_mesh_marks
 import numpy as np
 from bpy.app.handlers import persistent
 from .gpu_chain import EDGE_SELECTION
@@ -43,9 +44,9 @@ def stats(scene):
                                              'groups_culled', 'dirty', 'error')}, **cache_stats}
 
 
-def _jobs(scene):
+def _jobs(scene, *, render=False):
     from . import backend, routing, material_scope, stroke_variation,gpu_styles
-    if len(scene.view_layers)!=1:
+    if not render and len(scene.view_layers)!=1:
         raise ValueError('GPU 시험 경로는 단일 뷰 레이어만 지원합니다')
     jobs = []
     for node, common in backend._specifications(scene.lea_line.tree, with_output=True):
@@ -133,12 +134,15 @@ def _jobs(scene):
                     raise ValueError('GPU: Normal Offset은 단독 Marked Edge를 지원합니다')
                 proxy.overrides['_gpu_normal_offset'] = normal_offset
                 distortion = bool(gpu_styles.wave_amount(brush))
-                wave_contour = (visibility == 'VISIBLE' and not merge_groups and not object_enabled
-                                and (object_mode == -1 and proxy.outline
+                wave_contour = (not merge_groups and not object_enabled
+                                and (visibility == 'VISIBLE' and object_mode == -1 and proxy.outline
                                      or object_mode in {2, 3} and proxy.crease))
                 if distortion and not wave_contour and (object_mode or not proxy.edge_mark or
                         any(getattr(proxy, k) for k in features if k != 'edge_mark')):
-                    raise ValueError('GPU: 파형 왜곡은 보이는 Outline·Normal Angle 또는 단독 Marked Edge를 지원합니다')
+                    raise ValueError('GPU: 파형 왜곡은 보이는 Outline, Normal Angle 또는 단독 Marked Edge를 지원합니다')
+                if distortion and getattr(brush, 'line_direction_enabled', False) and (
+                        visibility != 'VISIBLE' or merge_groups):
+                    raise ValueError('GPU/CPU: 파형과 선 방향 조합은 보이는 개별 선을 지원합니다')
                 proxy.overrides['_gpu_distortion'] = distortion
                 proxy.overrides['_gpu_hidden'] = visibility == 'HIDDEN'
                 proxy.overrides['_gpu_material_filter'] = material_filter
@@ -155,7 +159,7 @@ def _jobs(scene):
     return jobs
 
 
-def _records(mesh, matrix, node, payload=None):
+def _records(mesh, matrix, node, payload=None, *, selected_faces=None):
     """Vectorized topology preparation; no view-dependent edge selection here."""
     nv, ne, npoly, nl = len(mesh.vertices), len(mesh.edges), len(mesh.polygons), len(mesh.loops)
     if not nv or not ne or not npoly:
@@ -214,13 +218,17 @@ def _records(mesh, matrix, node, payload=None):
         cosine_max = math.cos(min_angle) + 2e-7
         crease_range = min_angle <= max_angle + 2e-7
         crease = (counts == 2) & (dot >= cosine_min) & (dot <= cosine_max) & crease_range
+        if selected_faces is not None:
+            crease &= selected_faces[first] | selected_faces[last]
     test_material = node.material_boundary or 'material_boundary' in exclude
     if test_material:
         materials = np.empty(npoly, np.int32)
         mesh.polygons.foreach_get('material_index', materials)
         material_boundary = (counts == 2) & (materials[first] != materials[last])
+        if selected_faces is not None:
+            material_boundary &= selected_faces[first] | selected_faces[last]
     if node.edge_mark or 'edge_mark' in exclude:
-        marks = np.empty(ne, bool); mesh.edges.foreach_get('use_freestyle_mark', marks)
+        marks = read_mesh_marks(mesh, 'EDGE')
         marks &= ~border
         if node.edge_mark:
             fixed |= marks
@@ -243,9 +251,16 @@ def _records(mesh, matrix, node, payload=None):
             if test_crease and crease_range:
                 left, right = np.triu_indices(len(ns), k=1)
                 pairs = (ns[left] * ns[right]).sum(axis=1)
-                crease[edge] = np.any((pairs >= cosine_min) & (pairs <= cosine_max))
+                eligible = (pairs >= cosine_min) & (pairs <= cosine_max)
+                if selected_faces is not None:
+                    eligible &= selected_faces[incident[left]] | selected_faces[incident[right]]
+                crease[edge] = eligible.any()
             if test_material:
-                material_boundary[edge] = np.any(materials[incident] != materials[incident[0]])
+                incident_materials = materials[incident]
+                material_boundary[edge] = (
+                    np.any(incident_materials != incident_materials[0])
+                    and (selected_faces is None or selected_faces[incident].any())
+                )
             silhouette[edge]=test_outline and not object_edge and np.min(ns@ns.T)<1.-1e-7
             extra_start[edge]=len(extra);extra_count[edge]=len(ns)
             extra.extend((*normal,0.) for normal in ns)
@@ -307,9 +322,11 @@ def _records(mesh, matrix, node, payload=None):
             np.add.at(winding_sum, endpoints[:, 0], result[:, 2, 3])
             np.add.at(winding_sum, endpoints[:, 1], -result[:, 2, 3])
             joined = degree == 2
+            # Two outgoing unit rays sum to squared length 2-2*cos(turn).
+            # Planar joints through a right angle use the projected corner taper.
             if (np.any(degree > 2) or np.any(winding_sum[joined] != 0) or
-                    np.any(np.linalg.norm(ray_sum[joined], axis=1) > 1e-5)):
-                raise ValueError('GPU: 꺾임·분기·면 방향 변화가 있는 파형 왜곡은 Native를 사용하세요')
+                    np.any(np.sum(ray_sum[joined]**2, axis=1) > 2.000001)):
+                raise ValueError('GPU: 급한 꺾임·분기·면 방향 변화가 있는 파형 왜곡은 Native를 사용하세요')
         if normal_offset:
             if not np.all(manifold):
                 raise ValueError('GPU: 비매니폴드 모서리의 Normal Offset은 Native를 사용하세요')
@@ -354,7 +371,7 @@ def _stroke_group(brush, width, style, parts, object_depth=None):
             'size_reduction': _channel(brush, 'SIZE'), 'alpha_reduction': _channel(brush, 'ALPHA')}
 
 
-def _whole_mesh_material_target(mesh, obj, materials):
+def _material_face_selection(mesh, obj, materials):
     from . import native_core
     slots = [bool(slot.material and slot.material.original in materials) for slot in obj.material_slots]
     if not any(slots) or not mesh.polygons:
@@ -370,9 +387,7 @@ def _whole_mesh_material_target(mesh, obj, materials):
         mask = native_core.mesh_material_mask(mesh, slots)
     if not mask.any():
         return False
-    if not mask.all():
-        raise ValueError(f'GPU: {obj.name}의 일부 면만 재질 대상으로 선택되어 있습니다. 같은 메시의 모든 면을 선택하거나 Objects 대상으로 지정하세요')
-    return True
+    return True if mask.all() else mask
 
 
 def snapshot(scene, dg, *, preview_pixel_scale=1.0):
@@ -384,7 +399,7 @@ def snapshot(scene, dg, *, preview_pixel_scale=1.0):
     from . import backend, gpu_styles, gpu_depth, routing, width_profile
     start = time.perf_counter()
     render = dg.mode == 'RENDER'
-    jobs = _jobs(scene)
+    jobs = _jobs(scene, render=render)
     groups = []
     source_ids = set()
     object_depths = {}
@@ -422,6 +437,11 @@ def snapshot(scene, dg, *, preview_pixel_scale=1.0):
                 and not any(spec['enabled'] for spec in getattr(brush, 'distance_channels', {}).values())):
             width = width_profile.coverage_width(width, profile)
             style['params'][19, 0] = 1
+            if (not limit_total and object_mode in {0, 3} and not merge_mode
+                    and (node.crease or node.material_boundary)
+                    and not any(getattr(node, key) for key in (
+                        'outline', 'border', 'edge_mark', *routing.GPU_ONLY_EDGE_FEATURES))):
+                style['params'][19, 2] = 1
         style['params'][6, 2] = object_mode
         merged_style = style
         merged_node = node
@@ -447,10 +467,23 @@ def snapshot(scene, dg, *, preview_pixel_scale=1.0):
                 continue
             mesh = obj.to_mesh()
             try:
-                if not targeted and not _whole_mesh_material_target(mesh, obj, materials):
-                    continue
+                selected_faces = None
+                if not targeted:
+                    selection = _material_face_selection(mesh, obj, materials)
+                    if isinstance(selection, np.ndarray):
+                        if (not (node.crease or node.material_boundary) or merge_mode
+                                or any(getattr(node, key) for key in (
+                                    'outline', 'border', 'edge_mark',
+                                    *routing.GPU_ONLY_EDGE_FEATURES))):
+                            raise ValueError(f'GPU: {obj.name}의 일부 면 재질 선택은 Normal Angle과 Material Boundary에서 지원합니다')
+                        selected_faces = selection
+                    elif not selection:
+                        continue
                 merged = merge_depths.get(members.get(obj.original)) if merge_mode else None
-                payload={};records,extra=_records(mesh, instance.matrix_world, merged_node if merged is not None else node,payload)
+                payload = {}
+                records, extra = _records(mesh, instance.matrix_world,
+                                          merged_node if merged is not None else node, payload,
+                                          selected_faces=selected_faces)
                 if payload.get('mixed_normal_directions'):
                     style['params'][17,3] = 1
                 if len(records):
@@ -710,13 +743,17 @@ vec2 normalShift(int edge,vec4 p,vec4 q,vec4 points,vec2 normal,float side,bool 
     // Intersection of the two displaced edge tangents, with a bounded miter.
     return bisector*min(1.0/denominator,4.0/max(length(bisector),1e-5));
 }
-bool waveCorner(int link,vec4 joint,vec2 inward) {
-    if (link<0) return false;
+float waveCorner(int link,vec4 joint,vec2 inward,bool taper) {
+    if (link<0) return 0.0;
     vec4 far=viewProjection*vec4(record(link/2,1-link%2).xyz,1);
     float j=joint.z+joint.w, f=far.z+far.w;
     if (f<=0.0) far=mix(joint,far,j/(j-f));
     vec2 outgoing=(far.xy/far.w-joint.xy/joint.w)*viewportSize;
-    return length(outgoing)>1e-5 && dot(normalize(outgoing),inward)>-.985;
+    if (length(outgoing)<=1e-5) return 0.0;
+    float turn=dot(normalize(outgoing),inward);
+    // A bent joint needs coverage from both segments. The half-open
+    // ownership test is safe only when the projected tangents agree.
+    return taper && turn>-.985 ? 2.0 : float(turn>-.9999);
 }
 void main() {
     bool mixed=texelFetch(styleData,ivec2(17,0),0).w>.5;
@@ -733,6 +770,7 @@ void main() {
     waveEnds=vec2(0);
     waveCorners=vec2(0);
     waveSide=0.0;
+    waveDirected=0.0;
     normalSpans=vec4(0);
     normalSide=0.0;
     normalBaseSide=0.0;
@@ -748,6 +786,7 @@ void main() {
         // Keep chains that reach the authored length, allowing pixel rounding.
         chosen=chainSpan.z+1e-4>=lengths.x;
         int ends=int(chain.w);
+        waveDirected=float((ends>>2)&1);
         endExtension=vec2(float(ends&1),float((ends>>1)&1))*lengths.y;
         waveEnds=vec2(float(ends&1),float((ends>>1)&1));
         if (objectMode==0.0) jointExtension=lengths.y;
@@ -777,11 +816,11 @@ void main() {
         if (pa<=0.0) waveEnds.x=1.0;
         if (qa<=0.0) waveEnds.y=1.0;
         normalDepthPlanes=markedDepthPlanes(viewProjection,viewportSize,p,q,wb-wa,n0,n1);
-        if (objectMode!=0.0 && lengthValue>1e-5) {
+        if (lengthValue>1e-5) {
             int width=textureSize(jointData,0).x;
             ivec2 links=ivec2(texelFetch(jointData,ivec2(edge%width,edge/width),0).xy);
-            waveCorners=vec2(float(pa>0.0 && waveCorner(links.x,p,tangent)),
-                             float(qa>0.0 && waveCorner(links.y,q,-tangent)));
+            waveCorners=vec2(pa>0.0 ? waveCorner(links.x,p,tangent,objectMode!=0.0) : 0.0,
+                             qa>0.0 ? waveCorner(links.y,q,-tangent,objectMode!=0.0) : 0.0);
         }
     }
     float normalOffset=texelFetch(styleData,ivec2(17,0),0).z;
@@ -1001,11 +1040,12 @@ float waveHeight(float x,vec3 wave,float origin,float direction) {
     // The neighboring edge turns in screen space. Both strokes meet at
     // the same vertex instead of continuing along either old tangent.
     float taper=max(1.0,min(abs(wave.x),segmentLength*.5));
-    float join=(waveCorners.x>.5?smoothstep(0.0,taper,x):1.0)*
-               (waveCorners.y>.5?smoothstep(0.0,taper,segmentLength-x):1.0);
+    float join=(waveCorners.x>1.5?smoothstep(0.0,taper,x):1.0)*
+               (waveCorners.y>1.5?smoothstep(0.0,taper,segmentLength-x):1.0);
     return join*waveSide*wave.x*sin(6.28318530718*(x-origin)*direction/wave.y+wave.z);
 }
-float waveDistance(float reach,vec3 wave,vec2 run) {
+float waveDistance(float reach,vec3 wave,vec2 run,out float cross) {
+    cross=lineCoord.y;
     // Adjacent edges share coverage only while the run continues across
     // the joint. Ignore subpixel continuation within the depth search's
     // one-pixel/1024 precision so a cut at the joint keeps its round cap.
@@ -1015,10 +1055,12 @@ float waveDistance(float reach,vec3 wave,vec2 run) {
     if (styleValue(6).z == -1.0 && run.y-run.x < chainSpan.z-1.0)
         forward=waveSide>0.0;
     float origin=forward?run.x:run.y, direction=forward?1.0:-1.0;
-    if (waveCorners.x>.5) run.x=max(0.0,run.x);
-    if (waveCorners.y>.5) run.y=min(segmentLength,run.y);
-    if (waveEnds.x<.5 && run.x<-.001 && lineCoord.x<0.0) return reach;
-    if (waveEnds.y<.5 && run.y>segmentLength+.001 && lineCoord.x>=segmentLength) return reach;
+    if (waveDirected>.5 && styleValue(6).z == 0.0 && run.y-run.x>=chainSpan.z-0.01)
+        wave.x=-wave.x;
+    if (waveCorners.x>1.5) run.x=max(0.0,run.x);
+    if (waveCorners.y>1.5) run.y=min(segmentLength,run.y);
+    if (waveCorners.x<.5 && waveEnds.x<.5 && run.x<-.001 && lineCoord.x<0.0) return reach;
+    if (waveCorners.y<.5 && waveEnds.y<.5 && run.y>segmentLength+.001 && lineCoord.x>=segmentLength) return reach;
     float low=max(lineCoord.x-reach,run.x), high=min(lineCoord.x+reach,run.y);
     if (high<low || abs(lineCoord.y)>abs(wave.x)+reach) return reach;
     int steps=int(clamp(ceil((high-low)/min(1.0,wave.y/8.0)),1.0,64.0));
@@ -1030,15 +1072,20 @@ float waveDistance(float reach,vec3 wave,vec2 run) {
         vec2 span=end-start, delta=lineCoord-start;
         float t=clamp(dot(delta,span)/max(dot(span,span),1e-12),0.0,1.0);
         vec2 separation=delta-span*t;
-        closest=min(closest,dot(separation,separation));
+        float distanceSq=dot(separation,separation);
+        if (distanceSq<closest) {
+            closest=distanceSq;
+            cross=dot(separation,normalize(vec2(-span.y,span.x)+vec2(0.0,1e-12)));
+        }
         start=end;
     }
     return sqrt(closest);
 }
-float cutWaveDistance(float reach,vec3 wave,vec2 depths,float position,bool hidden) {
+float cutWaveDistance(float reach,vec3 wave,vec2 depths,float position,bool hidden,out float cross) {
+    cross=lineCoord.y;
     vec4 span=readStyleTex(visibilityData,int(edgeIndex));
     if (spanSample(screenEnds,depths,position/segmentLength,hidden,normalDepthPlanes,true)) {
-        return waveDistance(reach,wave,waveRun(span,depths,position,reach,hidden));
+        return waveDistance(reach,wave,waveRun(span,depths,position,reach,hidden),cross);
     }
     // The displaced centerline stops at the cut, but its round cap can
     // cover pixels whose projection onto the source edge is across it.
@@ -1052,7 +1099,9 @@ float cutWaveDistance(float reach,vec3 wave,vec2 depths,float position,bool hidd
         float inside=position+direction*(gap+.002);
         if (inside<=0.0 || inside>=segmentLength ||
                 !spanSample(screenEnds,depths,inside/segmentLength,hidden,normalDepthPlanes,true)) continue;
-        closest=min(closest,waveDistance(reach,wave,waveRun(span,depths,inside,reach,hidden)));
+        float candidateCross;
+        float candidate=waveDistance(reach,wave,waveRun(span,depths,inside,reach,hidden),candidateCross);
+        if (candidate<closest) { closest=candidate; cross=candidateCross; }
     }
     return closest;
 }
@@ -1092,9 +1141,10 @@ void main() {
     bool splitWave=wave.x!=0.0 && directionInfo.w>.5;
     vec2 run=vec2(0.0);
     float splitDistance=reach;
+    float stampCross=lineCoord.y;
     if (splitWave) {
         if (segmentLength<=1e-5 || abs(lineCoord.y)>abs(wave.x)+reach) discard;
-        splitDistance=cutWaveDistance(reach,wave,segmentDepths(),t*segmentLength,modes.x>1.5);
+        splitDistance=cutWaveDistance(reach,wave,segmentDepths(),t*segmentLength,modes.x>1.5,stampCross);
     } else if(modes.x>.5){
         vec4 points=screenEnds;
         if (viewExtra.z>0.0) points-=viewExtra.xyxy;
@@ -1131,7 +1181,9 @@ void main() {
         if (extendsJoint) {
             outside=max(0.0,overrun-extension);
         } else if (wantHidden!=hidden) {
-            if (extension<=0.0 || objectMode!=0.0 || segmentLength<=1e-5 || abs(lineCoord.y)>=reach) discard;
+            bool roundCut=styleValue(19).z>.5 && (objectMode==0.0 || objectMode==3.0);
+            if ((!roundCut && (extension<=0.0 || objectMode!=0.0)) ||
+                    segmentLength<=1e-5 || abs(lineCoord.y)>=reach) discard;
             overrun=max(0.0,overrun);
             float remaining=extension+reach-overrun;
             if (remaining<=0.0) discard;
@@ -1181,7 +1233,7 @@ void main() {
         run=vec2(waveEnds.x>.5?0.0:-before,segmentLength+(waveEnds.y>.5?0.0:after));
     }
     float distanceValue=splitWave?splitDistance:
-        (wave.x!=0.0?waveDistance(reach,wave,run):length(vec2(outside,lineCoord.y)));
+        (wave.x!=0.0?waveDistance(reach,wave,run,stampCross):length(vec2(outside,lineCoord.y)));
     float coverage=clamp(radius+0.5-distanceValue,0.0,1.0);
     if (filterSpec.x!=1.0 || filterSpec.y!=1.0) {
         vec4 samples=styleValue(21);
@@ -1200,7 +1252,7 @@ void main() {
             (lineCoord.x>segmentLength+.002 && waveEnds.y<.5)) discard;
         float phase=mix(chainSpan.x,chainSpan.y,lineCoord.x/max(segmentLength,1e-5));
         float side=chainSpan.x<=chainSpan.y?1.0:-1.0;
-        coverage*=stampCoverage(phase,lineCoord.y*side,2.0*radius,stampPeriod);
+        coverage*=stampCoverage(phase,stampCross*side,2.0*radius,stampPeriod);
     }
     fragColor=vec4(color,opacity*coverage);
 }
@@ -1222,7 +1274,7 @@ def _resources():
     interface.flat('VEC4','screenEnds');interface.flat('VEC3','chainSpan')
     interface.flat('VEC2','endExtension')
     interface.flat('VEC4','normalSpans');interface.flat('FLOAT','normalSide');interface.flat('FLOAT','normalBaseSide')
-    interface.flat('FLOAT','waveSide');interface.flat('VEC2','waveEnds');interface.flat('VEC2','waveCorners')
+    interface.flat('FLOAT','waveSide');interface.flat('FLOAT','waveDirected');interface.flat('VEC2','waveEnds');interface.flat('VEC2','waveCorners')
     interface.flat('VEC4','normalDepthPlanes')
     interface.flat('VEC2','objectOutside')
     interface.flat('VEC2','objectDepthGradient')

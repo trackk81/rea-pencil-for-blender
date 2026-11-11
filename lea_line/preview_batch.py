@@ -94,7 +94,7 @@ def replace_snapshots(pairs, styles=()):
             raise ValueError('Preview output is held by final-render staging')
         old=preview.data;owner=preview.get(viewport.OWNER)
         for data in (old,snapshot):
-            if (not preview_material._valid(data) or data.bl_rna.identifier!='GreasePencilv3'
+            if (not preview_material._valid(data) or data.bl_rna.identifier not in {'GreasePencilv3', 'GreasePencil'}
                     or data.library or not data.get(viewport.TAG) or data.get(viewport.OWNER)!=owner):
                 raise ValueError('Snapshot ownership/type mismatch')
         if not snapshot.get(preview_material.OUTPUT) or snapshot.users or snapshot.use_fake_user:

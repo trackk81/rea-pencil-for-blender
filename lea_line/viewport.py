@@ -7,11 +7,11 @@ import uuid
 import math
 
 import bpy
-from .blender_compat import grease_pencil_data
+from .blender_compat import grease_pencil_data, lineart_width_property, lineart_width_value
 
 from . import free_view
 from . import backend, routing, material_scope, preview_camera, preview_stroke, preview_material
-from .width_profile import live_coverage_supported, live_coverage_width, live_variable_coverage_supported
+from .width_profile import live_coverage_supported, live_variable_coverage_supported
 
 TAG = "rea_pencil_preview"
 OWNER = "rea_pencil_preview_owner"
@@ -209,8 +209,8 @@ def sync_preview(scene, material_render=False):
             warnings.append(f"{node.name}: Smoothing Boundary uses GPU preview or GPU render.")
         if routing.any_enabled(node, 'object_edge'):
             warnings.append(f"{node.name}: Object contours use GPU preview or GPU render.")
-        if free_view.dimensions(scene) and (material_scope.active(node) or node.use_material_functions):
-            raise ValueError('Free View material-face evaluation is not yet verified; select Scene Camera')
+        if free_view.dimensions(scene) and node.use_material_functions:
+            raise ValueError('Native 자유 시점은 Line Functions를 지원하지 않습니다.')
         material_live = material_scope.active(node) and not material_render
         target_collection = backend.source_collection(scene, node)
         for visibility, enabled in (("VISIBLE", node.visible), ("HIDDEN", node.hidden)):
@@ -248,6 +248,7 @@ def sync_preview(scene, material_render=False):
             desired.add(key)
             obj = _object(scene, owner, key)
             overlay_visible = False
+            material_snapshot_ready = False
             if material_render:
                 from . import preview_outline
                 preview_outline.cleanup(obj)
@@ -325,16 +326,13 @@ def sync_preview(scene, material_render=False):
                 "show_viewport": not material_live,
                 "show_render": not material_live,  # Object is excluded from final renders.
             }
-            thickness = max(1, min(200, round(width)))
-            if hasattr(modifier, 'thickness'):
-                geometry['thickness'] = thickness
-            else:
-                # Blender converts saved Line Art thickness to world radius.
-                geometry['radius'] = thickness / 2000.0
+            width_property = lineart_width_property(modifier)
+            geometry[width_property] = lineart_width_value(width_property, width)
             for name, value in geometry.items():
                 _set(modifier, name, value)
             if material_live:
                 result = preview_material.sync(scene, node, obj)
+                material_snapshot_ready = result.get('ok', False)
                 _last_sync_stats['geometry_writes'] += result.get('writes', int(result.get('changed', False)))
                 warnings.extend(result.get('warnings', ()))
                 if not result.get('ok', True) and not result.get('preserved', False):
@@ -368,7 +366,7 @@ def sync_preview(scene, material_render=False):
                 live_width = width
                 if getattr(scene.lea_line, 'preview_simple_coverage', False):
                     if live_coverage_supported(selected_brush):
-                        live_width = live_coverage_width(width)
+                        live_width = preview_camera.simple_coverage_width(scene, node, width)
                     elif not live_variable_coverage_supported(selected_brush):
                         warnings.append('Simple live coverage supports uniform solid strokes or directed open size curves; unsupported styles keep geometric width.')
                 _last_sync_stats['geometry_writes'] += preview_camera.sync(obj, scene, live_width, _set)
@@ -398,6 +396,20 @@ def sync_preview(scene, material_render=False):
                     and not stamp_brush.active(selected_brush)
                     and (not preview_stroke._modifiers(obj) or basic_wave)
                     and not texture_maps.maps(selected_brush))
+                # A detached material snapshot has already been clipped by
+                # the private scene, including non-target occluders. A second
+                # depth test cuts the rounded caps at those same boundaries.
+                if (material_snapshot_ready and free_view.dimensions(scene)
+                        and scene.lea_line.preview_simple_coverage
+                        and len(specifications) == 1 and visibility == 'VISIBLE' and not node.hidden
+                        and (features['crease'] or features['material_boundary'])
+                        and not any(on for key, on in features.items()
+                                    if key not in {'crease', 'material_boundary'})
+                        and selected_brush.alpha == 1. and live_coverage_supported(selected_brush)
+                        and not stamp_brush.active(selected_brush)
+                        and not preview_stroke._modifiers(obj)
+                        and not texture_maps.maps(selected_brush)):
+                    overlay_visible = True
             _set(obj, 'show_in_front', overlay_visible, 'visibility_writes')
             zero_alpha=stamp_brush.active(selected_brush) and selected_brush.alpha==0
             if bool(obj.get('rea_stamp_zero_alpha',False))!=zero_alpha:obj['rea_stamp_zero_alpha']=zero_alpha

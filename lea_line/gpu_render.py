@@ -78,10 +78,12 @@ def _restore_all(*args):
     _line_render_scopes.clear()
 
 
-def render_lines(scene, *, write_still=False, capture=False):
+def render_lines(scene, *, write_still=False, capture=False, layer=None):
     """Run the independent engine and restore the caller's render settings."""
     global LAST_RESULT, _capture_requested, _captured_pixels
     from . import ui
+    if layer is None and len(scene.view_layers) != 1:
+        raise ValueError('여러 뷰 레이어의 선은 F12 합성에서 렌더하세요')
     flags = {name: getattr(scene.render, name) for name in
              ('engine', 'use_freestyle', 'use_compositing', 'use_sequencer')}
     auto_sync = scene.lea_line.auto_sync
@@ -104,7 +106,8 @@ def render_lines(scene, *, write_still=False, capture=False):
         scene.render.use_compositing = False
         scene.render.use_sequencer = False
         grease_pencils = _exclude_grease_pencils(scene)
-        operation = bpy.ops.render.render(write_still=write_still, scene=scene.name)
+        options = {'layer': layer} if layer is not None else {}
+        operation = bpy.ops.render.render(write_still=write_still, scene=scene.name, **options)
         if 'CANCELLED' in operation or LAST_RESULT.get('status') == 'cancelled':
             return {'status': 'cancelled', 'seconds': time.perf_counter()-started}
         if LAST_RESULT.get('status') != 'ok':
@@ -442,7 +445,8 @@ class _LineEngine:
                 if rgba is None or self.test_break():
                     LAST_RESULT = {'status': 'cancelled'}
                     return
-                result = self.begin_result(0, 0, rgba.shape[1], rgba.shape[0], view=view)
+                result = self.begin_result(0, 0, rgba.shape[1], rgba.shape[0],
+                                           layer=depsgraph.view_layer.name, view=view)
                 publish(result.layers[0], rgba)
                 self.end_result(result)
                 result = None
@@ -461,6 +465,7 @@ class _LineEngine:
             if _capture_requested:
                 _captured_pixels = captures if stereo else captures['']
             LAST_RESULT = {'status': 'ok', 'depsgraph_mode': depsgraph.mode, 'line_backend': 'CPU' if cpu else 'GPU',
+                'view_layer': depsgraph.view_layer.name,
                 'prepare_seconds': prepared-start + cpu_prepare_seconds,
                 'engine_seconds': time.perf_counter()-start, 'edges': entry['edges'],
                 'depth_triangles': entry['depth_triangles'] if cpu else len(entry['depth']['triangles']),

@@ -7,6 +7,7 @@ provide a live viewport cache. Call capture_strokes again after scene changes.
 """
 from contextlib import contextmanager
 import bpy
+from .blender_compat import write_mesh_marks
 from . import native_core
 
 
@@ -106,7 +107,7 @@ def scoped_faces(scene, node):
             slots = [slot.material for slot in obj.material_slots]
             marks = native_core.mesh_material_mask(copied, [slot in materials for slot in slots],
                                                    allowed=allowed, explicit=explicit)
-            copied.polygons.foreach_set('use_freestyle_mark', marks)
+            write_mesh_marks(copied, 'FACE', marks)
             copied.update()
             obj.data = copied
             report['marked_faces'] += int(marks.sum())

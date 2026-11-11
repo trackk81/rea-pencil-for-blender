@@ -126,10 +126,10 @@ def _start(scene, area, region, *, automatic=False):
 
 
 def unsupported_reason(specifications):
-    from . import texture_maps, material_scope, routing
+    from . import texture_maps, routing
     for node, common in specifications:
-        if material_scope.active(node) or node.use_material_functions:
-            return 'Native 자유 시점은 재질 대상과 Line Functions를 지원하지 않습니다.'
+        if node.use_material_functions:
+            return 'Native 자유 시점은 Line Functions를 지원하지 않습니다.'
         for visibility in ('VISIBLE', 'HIDDEN'):
             for job in routing.jobs(node, common, visibility):
                 if texture_maps.maps(job['brush']):

@@ -1,15 +1,17 @@
 """CPU-only final ink with solid or image-stamp coverage."""
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from ctypes import (POINTER, Structure, byref, c_float, c_size_t, c_uint32,
+from ctypes import (POINTER, Structure, addressof, byref, c_float, c_size_t, c_uint32,
                     c_void_p)
 import math
 import os
 import time
+from itertools import groupby
 
 import numpy as np
 from mathutils import Vector
 
+from .blender_compat import read_mesh_marks
 from . import backend, gpu_depth, gpu_preview, gpu_styles, native_core, width_profile
 
 
@@ -22,7 +24,8 @@ class _Style(Structure):
     _fields_ = [('flags', c_uint32), ('min_cos', c_float), ('max_cos', c_float),
                 ('radius', c_float), ('aa', c_float), ('rgba', c_float * 4),
                 ('stamp', c_void_p), ('stamp_width', c_size_t), ('stamp_height', c_size_t),
-                ('stamp_period', c_float), ('reduction', _Reduction * 2), ('stroke_curves', c_void_p * 2)]
+                ('stamp_period', c_float), ('reduction', _Reduction * 2), ('stroke_curves', c_void_p * 2),
+                ('wave', c_float * 3), ('dash', c_float * 3)]
 
 
 class _Mesh(Structure):
@@ -36,6 +39,8 @@ class _Mesh(Structure):
         ('perspective', c_uint32), ('handedness', c_float), ('owner', c_uint32),
         ('style_ids', c_void_p), ('style_count', c_size_t), ('marks', c_void_p),
         ('world', c_float * 12),
+        ('face_masks', c_void_p),
+        ('face_materials', c_void_p),
     ]
 
 
@@ -46,7 +51,7 @@ def _api():
     except AttributeError as error:
         raise ValueError('CPU 선 렌더용 Rust 모듈이 설치되어 있지 않습니다') from error
     version.argtypes, version.restype = [], c_uint32
-    if version() != 3:
+    if version() != 7:
         raise ValueError('CPU 선 렌더용 Rust 모듈 버전이 호환되지 않습니다')
     signatures = {
         'create': ([c_size_t, c_size_t, POINTER(_Style), c_size_t], c_void_p),
@@ -64,31 +69,41 @@ def _api():
 
 
 def snapshot(scene, depsgraph):
-    jobs = gpu_preview._jobs(scene)
+    jobs = [
+        job
+        for _, group in groupby(gpu_preview._jobs(scene, render=depsgraph.mode == 'RENDER'),
+                                key=lambda job: id(job[0].source))
+        for job in sorted(group, key=lambda job: not job[0]._gpu_hidden)
+    ]
     styles = []
     coverage = []
     reduction_curves = []
     camera_references = []
     stroke_curves = []
     for node, brush, _ in jobs:
-        if (node._gpu_hidden or node._gpu_merge_mode or node.object_edge
-                or any(getattr(node, k) for k in ('material_boundary', 'wireframe',
+        if (node._gpu_merge_mode or node.object_edge
+                or any(getattr(node, k) for k in ('wireframe',
                                                  'smoothing_boundary', 'ridge_valley', 'suggestive_contour'))):
-            raise ValueError(f'CPU 선 렌더: {node.name}은 보이는 Outline, Open Edge, Normal Angle, Selected Edges를 지원합니다')
+            raise ValueError(f'CPU 선 렌더: {node.name}은 보이는 Outline, Open Edge, Normal Angle, Selected Edges, Material Boundary를 지원합니다')
+        if node._gpu_hidden and (node.outline or node.border or node.edge_mark
+                                 or not (node.crease or node.material_boundary)):
+            raise ValueError(f'CPU 선 렌더: {node.name}의 숨은 선은 Normal Angle과 Material Boundary에서 지원합니다')
         scale = backend.width_scale(scene, node)
         params = gpu_styles.snapshot(brush, scale, output=node.line_output)
         period = float(params['params'][22,0])
-        unsupported_chain = (gpu_styles.wave_amount(brush) or
-                             any(getattr(brush, key, False) for key in
-                                 ('dashed', 'min_line_length', 'extend', 'normal_offset')))
-        if ((brush.brush_type != 'SIMPLE' or unsupported_chain) and not period or params['maps']
+        unsupported_chain = any(getattr(brush, key, False) for key in
+                                ('min_line_length', 'extend', 'normal_offset'))
+        if ((getattr(brush, 'brush_type', 'SIMPLE') != 'SIMPLE' and not period)
+                or unsupported_chain or params['maps']
                 or np.any(params['params'][17, :3])
                 or node.line_output.over_sampling != 1):
-            raise ValueError(f'CPU 선 렌더: {node.name}은 기본 Simple 실선·질감 브러시와 오버샘플링 1을 지원합니다')
+            raise ValueError(f'CPU 선 렌더: {node.name}은 오버샘플링 1에서 Simple·질감 브러시를 지원합니다. 추가 맵과 오프셋·길이 효과는 지원하지 않습니다')
         outline, border = node.outline, node.border or (node.outline and node.outline_open)
-        reserve = (node.crease or node.edge_mark) and not outline
+        reserve = (node.crease or node.edge_mark or node.material_boundary) and not outline
         flags = int(outline) | int(border) << 1 | int(node.crease) << 2 | int(reserve) << 3
         flags |= int(node.edge_mark) << 4 | int('edge_mark' in node._gpu_exclude) << 5
+        flags |= int(node.material_boundary) << 6 | int('material_boundary' in node._gpu_exclude) << 7
+        flags |= int(node._gpu_hidden) << 8
         width = brush.thickness * scale
         if not period and scene.lea_line.stroke_width_profile == 'PENCIL_SIMPLE':
             width = width_profile.coverage_width(width, 'PENCIL_SIMPLE')
@@ -109,16 +124,28 @@ def snapshot(scene, depsgraph):
         camera_references.append(from_camera)
         profiles = [np.ascontiguousarray(params['curves'][:,index])
                     if params['params'][3,index] else None for index in range(2)]
-        if any(profile is not None for profile in profiles) and (
-                getattr(brush, 'line_direction_enabled', False) or getattr(brush, 'split_angle_enabled', False)):
+        wave = bool(gpu_styles.wave_amount(brush))
+        direction = getattr(brush, 'line_direction_enabled', False)
+        shaped_stroke = any(profile is not None for profile in profiles) or getattr(brush, 'dashed', False)
+        if (shaped_stroke and direction or (wave or shaped_stroke)
+                and getattr(brush, 'split_angle_enabled', False)):
             raise ValueError(f'CPU 선 렌더: {node.name}의 스트로크 곡선과 방향 지정·각도 분할 조합은 미지원입니다')
+        dash = params['params'][4, 1:] if params['params'][4, 0] else (0., 0., 0.)
+        if wave and direction:
+            # The inactive dash phase carries the angle without changing the native ABI.
+            flags |= 1 << 9
+            # Bit 10 is winding, bits 11–13 select the loop start point.
+            flags |= int(params['params'][18, 3]) << 10
+            dash = (0., 0., float(params['params'][7, 1]))
         stroke_curves.extend(profiles)
         styles.append(_Style(flags, math.cos(node.normal_angle_max)-2e-7,
                              math.cos(node.normal_angle_min)+2e-7, width*0.5,
                              node.line_output.antialiasing, (c_float*4)(*brush.color, brush.alpha),
                              stamp.ctypes.data if stamp is not None else None, columns, height, period, (_Reduction*2)(*channels),
                              (c_void_p*2)(*(profile.ctypes.data if profile is not None else None
-                                            for profile in profiles))))
+                                            for profile in profiles)),
+                             (c_float*3)(*params['params'][18, :3]),
+                             (c_float*3)(*dash)))
     return {'jobs': jobs, 'styles': (_Style * len(styles))(*styles), 'stamp_coverage': coverage,
             'reduction_curves': reduction_curves, 'camera_references': camera_references,
             'stroke_curves': stroke_curves}
@@ -137,7 +164,7 @@ def _targeted(mesh, obj, parent, node, targets):
     if material_filter is None:
         return False
     scope, materials = material_filter
-    return (scope is None or obj.original in scope) and gpu_preview._whole_mesh_material_target(mesh, obj, materials)
+    return (scope is None or obj.original in scope) and gpu_preview._material_face_selection(mesh, obj, materials)
 
 
 def _packet(instance, owner, projection, world, perspective, jobs):
@@ -148,12 +175,23 @@ def _packet(instance, owner, projection, world, perspective, jobs):
     parent = instance.parent.original if instance.is_instance and instance.parent else None
     matching = {}
     style_ids = []
+    selections = []
     for i, (node, _, targets) in enumerate(jobs):
         key = id(node._gpu_material_filter), id(targets)
         if key not in matching:
             matching[key] = _targeted(mesh, obj, parent, node, targets)
-        if matching[key]:
+        selected = matching[key]
+        if isinstance(selected, np.ndarray):
+            if node.outline or node.border or node.edge_mark:
+                raise ValueError('CPU 선 렌더: 일부 면의 재질 선택은 Normal Angle과 Material Boundary에서 지원합니다')
             style_ids.append(i)
+            selections.append(selected)
+        elif selected:
+            style_ids.append(i)
+            selections.append(None)
+    face_masks = (c_void_p * len(selections))(
+        *(mask.ctypes.data if mask is not None else None for mask in selections)
+    ) if any(mask is not None for mask in selections) else None
     style_ids = np.array(style_ids, dtype=np.uint32)
     vertices = _array(mesh.vertices, 'co', (len(mesh.vertices),3), np.float32)
     triangles = gpu_depth.mesh_triangles(mesh)
@@ -162,6 +200,7 @@ def _packet(instance, owner, projection, world, perspective, jobs):
     loop_edges = loop_vertices = sizes
     normals = np.empty((0,3), np.float32)
     marks = None
+    face_materials = None
     transform = instance.matrix_world.copy()
     normal = (0.,)*9
     eye = (0.,)*3
@@ -169,7 +208,9 @@ def _packet(instance, owner, projection, world, perspective, jobs):
     if len(style_ids):
         edges = _array(mesh.edges, 'vertices', (len(mesh.edges),2), np.int32)
         if any(jobs[i][0].edge_mark or 'edge_mark' in jobs[i][0]._gpu_exclude for i in style_ids):
-            marks = _array(mesh.edges, 'use_freestyle_mark', len(mesh.edges), np.bool_)
+            marks = read_mesh_marks(mesh, 'EDGE')
+        if any(jobs[i][0].material_boundary or 'material_boundary' in jobs[i][0]._gpu_exclude for i in style_ids):
+            face_materials = _array(mesh.polygons, 'material_index', len(mesh.polygons), np.int32)
         if mesh.loops:
             loop_edges = _array(mesh.attributes['.corner_edge'].data, 'value', len(mesh.loops), np.int32)
             loop_vertices = _array(mesh.attributes['.corner_vert'].data, 'value', len(mesh.loops), np.int32)
@@ -188,9 +229,12 @@ def _packet(instance, owner, projection, world, perspective, jobs):
                    (c_float*16)(*(v for row in clip for v in row)), (c_float*9)(*normal),
                    (c_float*3)(*eye),perspective,handedness,owner,
                    style_ids.ctypes.data,len(style_ids), marks.ctypes.data if marks is not None else None,
-                   (c_float*12)(*(transform[row][col] for row in range(3) for col in range(4))))
+                   (c_float*12)(*(transform[row][col] for row in range(3) for col in range(4))),
+                   addressof(face_masks) if face_masks is not None else None,
+                   face_materials.ctypes.data if face_materials is not None else None)
     # Keep every ctypes input alive until its worker returns.
-    return packet, (vertices, triangles, edges, loop_edges, loop_vertices, sizes, normals, style_ids, marks)
+    return packet, (vertices, triangles, edges, loop_edges, loop_vertices, sizes, normals,
+                    style_ids, marks, face_masks, selections, face_materials)
 
 
 def draw(scene, depsgraph, entry, frame, bounds, *, world=None, shift_x=None):

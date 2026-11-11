@@ -156,7 +156,7 @@ class LEABrushDetailNode(bpy.types.Node):
         items=[('KEEP','Keep','Preserve incoming start'),('MIN_X_MIN_Y','Leftmost','Leftmost point, then lowest'),
                ('MAX_X_MIN_Y','Rightmost','Rightmost point, then lowest'),('MIN_Y_MIN_X','Lowest','Lowest point, then leftmost'),
                ('MAX_Y_MIN_X','Highest','Highest point, then leftmost')],default='KEEP',update=_changed)
-    loop_orientation: EnumProperty(name='Loop Direction (Live)', description='Live projected winding; final Freestyle chaining remains independent',
+    loop_orientation: EnumProperty(name='Loop Direction', description='Projected winding in Native preview and in GPU/CPU Wave with Line Direction enabled',
         items=[('KEEP','Keep','Preserve incoming winding'),('CLOCKWISE','Clockwise','Clockwise in projected camera space'),
                ('COUNTERCLOCKWISE','Counterclockwise','Counterclockwise in projected camera space')],default='KEEP',update=_changed)
     normal_offset: FloatProperty(name='Normal Offset', description='Offset along the projected stroke normal, in pixels; chain direction determines the sign', min=-1000, max=1000, default=0, subtype='PIXEL', update=_changed)

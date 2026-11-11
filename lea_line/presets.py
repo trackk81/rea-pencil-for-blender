@@ -26,7 +26,8 @@ PENCIL_TIPS = {
 }
 PENCIL_PATTERN = {'graphite_grain': (.35, .10), 'dry_charcoal': (.37, .13), 'soft_graphite': (.28, .045)}
 GROUPS = {'BRUSH': ('caps',),
-          'STROKE': tuple(field for field in LEGACY_FIELDS if field != 'caps') + EXTRA_FIELDS}
+          'STROKE': tuple(field for field in LEGACY_FIELDS + EXTRA_FIELDS
+                          if field != 'caps' and field not in PENCIL_FIELDS)}
 BUILTINS = {
     'BRUSH': {'round': ('Round', {'caps': 'ROUND'}),
               'flat': ('Flat', {'caps': 'BUTT'}),
@@ -155,6 +156,10 @@ def _validated(detail, group, values, *, tip=None):
     if not isinstance(values, dict):
         raise ValueError('Preset fields do not match the supported group')
     scalar = {name: value for name, value in values.items() if name != CURVES_KEY}
+    # Older saved Stroke presets also captured tip settings. Keep their
+    # stroke effects, and let the active Brush preset own the tip.
+    if group == 'STROKE' and set(PENCIL_FIELDS).issubset(scalar):
+        scalar = {name: value for name, value in scalar.items() if name not in PENCIL_FIELDS}
     expected = set(_fields(group))
     if tip:
         expected.update(PENCIL_FIELDS)

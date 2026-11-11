@@ -33,15 +33,18 @@ def validate(brush):
         stamp_map = stamp_brush.detail_map(brush, 'brush')
         if stamp_map and math.prod(stamp_map.image.size) > 16_777_216:
             raise ValueError('GPU/CPU Brush Map은 16M 픽셀까지 지원합니다')
-        if (chosen or needs_chain(brush) or brush.offset_x or brush.offset_y or
+        if (chosen or any(getattr(brush, key, False) for key in ('min_line_length', 'extend', 'normal_offset'))
+                or brush.offset_x or brush.offset_y or
                 brush.stamp_reduction_start != 1. or brush.stamp_reduction_end != 1.):
-            raise ValueError('GPU/CPU 질감 브러시는 추가 맵·점선·곡선·오프셋·스탬프 감소 없이 지원합니다')
+            raise ValueError('GPU/CPU 질감 브러시는 추가 맵·길이 효과·오프셋·스탬프 감소 없이 지원합니다')
     if set(chosen)-{'color','size'}:raise ValueError('GPU: 왜곡 맵·Line Functions는 Native를 사용하세요')
     for n in chosen.values():
         if n.source_type=='IMAGE':
             texture_maps.check_image(n.image)
             if n.image.size[0]*n.image.size[1]>16_777_216:raise ValueError('GPU: 16M 픽셀을 넘는 맵은 Native를 사용하세요')
-    if (getattr(brush,'loop_start','KEEP')!='KEEP' or getattr(brush,'loop_orientation','KEEP')!='KEEP') and needs_chain(brush):
+    directed_wave = bool(wave_amount(brush) and getattr(brush, 'line_direction_enabled', False))
+    if needs_chain(brush) and not directed_wave and (getattr(brush, 'loop_start', 'KEEP') != 'KEEP'
+            or getattr(brush, 'loop_orientation', 'KEEP') != 'KEEP'):
         raise ValueError('GPU: 사용자 지정 루프 시작/방향은 Native를 사용하세요')
     if getattr(brush,'extend',0) and any(getattr(brush,k,False) for k in ('dashed','taper','size_curve_enabled','alpha_curve_enabled')):
         raise ValueError('GPU: 점선·스트로크 곡선과 함께 선을 연장하려면 Native를 사용하세요')
@@ -49,8 +52,8 @@ def validate(brush):
             ('extend','min_line_length','dashed','taper','size_curve_enabled','alpha_curve_enabled'))):
         raise ValueError('GPU: 맵·점선·곡선·길이 효과와 Normal Offset을 함께 쓰려면 Native를 사용하세요')
     if wave_amount(brush) and (chosen or any(getattr(brush,k,False) for k in
-            ('normal_offset','extend','min_line_length','dashed','taper','size_curve_enabled','alpha_curve_enabled','line_direction_enabled'))):
-        raise ValueError('GPU: 맵·오프셋·점선·곡선·길이·방향 효과와 왜곡을 함께 쓰려면 Native를 사용하세요')
+            ('normal_offset','extend','min_line_length','dashed','taper','size_curve_enabled','alpha_curve_enabled'))):
+        raise ValueError('GPU: 맵·오프셋·점선·곡선·길이 효과와 왜곡을 함께 쓰려면 Native를 사용하세요')
     return chosen
 
 
@@ -88,6 +91,9 @@ def snapshot(brush,scale=1.,hidden=False,depth=False,*,output=None):
     params[17,:3]=(getattr(brush,'offset_x',0.)*scale,-getattr(brush,'offset_y',0.)*scale,getattr(brush,'normal_offset',0.)*scale)
     if wave_amount(brush):
         params[18,:3]=(wave_amount(brush)*scale,max(.0001,brush.distortion_wavelength*scale),brush.distortion_phase)
+        start = ('KEEP', 'MIN_X_MIN_Y', 'MAX_X_MIN_Y', 'MIN_Y_MIN_X', 'MAX_Y_MIN_X')
+        start_index = start.index(getattr(brush, 'loop_start', 'KEEP'))
+        params[18,3] = 2 * start_index + (getattr(brush, 'loop_orientation', 'KEEP') == 'COUNTERCLOCKWISE')
     references=[]
     channels=getattr(brush,'distance_channels',{})
     for index,kind in enumerate(('SIZE','ALPHA')):

@@ -1,3 +1,12 @@
+## 0.28.20 — 웨이브·F12 합성 개선
+
+- 보이는 Marked Edge, Outline, Normal Angle에서 Wave와 사용자 지정 Line Direction을 함께 쓸 수 있습니다. 닫힌 루프는 시작점과 시계·반시계 방향을 지정할 수 있습니다.
+- 숨은 Normal Angle의 기본 Wave를 GPU 미리보기와 CPU 라인 렌더에 추가했습니다. 가림 경계에서 파형이 다시 시작하는 동작을 Pencil+와 비교했습니다.
+- F12 뷰 레이어별 선 패스 합성과 스테레오 출력을 지원합니다. 연결된 Render Layers가 있으면 연결되지 않은 노드의 선 패스는 생략합니다.
+- 카메라 없는 일반 미리보기의 Normal Angle과 Material Boundary 가림 경계를 개선했습니다.
+
+새 일반 미리보기 AA와 병합 Outline Wave는 시험 단계입니다. 숨은 선의 사용자 지정 Wave 방향은 기존 지원 범위를 따릅니다.
+
 ## 0.28.19 — CPU Stroke Size·Alpha Reduction
 
 - CPU 라인 렌더에서 Brush Detail의 **Stroke Size Reduction Settings**와 **Stroke Alpha Reduction Settings**를 각각 또는 함께 적용할 수 있습니다. 저장된 설정을 유지한 도쿄 장면에서 Size 단독 및 Size·Alpha 조합을 렌더했습니다.

@@ -9,11 +9,14 @@ def _render_beauty(scene, write_still):
 
 
 def render(scene, *, write_still=False):
-    if scene.render.engine not in {'BLENDER_EEVEE_NEXT', 'CYCLES', 'BLENDER_WORKBENCH'}:
+    if scene.render.engine not in {'BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT', 'CYCLES', 'BLENDER_WORKBENCH'}:
         raise ValueError('장면 렌더 엔진을 EEVEE 또는 Cycles로 선택하세요')
     started = time.perf_counter()
-    old_nodes = scene.use_nodes
-    graph = scene.node_tree
+    modern = hasattr(scene, 'compositing_node_group')
+    original_group = scene.compositing_node_group if modern else None
+    temporary_group = None
+    old_nodes = bool(original_group) if modern else scene.use_nodes
+    graph = None if modern else scene.node_tree
     original_ids = {n.as_pointer() for n in graph.nodes} if graph else set()
     old_active = graph.nodes.active if graph else None
     flags = {k: getattr(scene.render, k) for k in
@@ -35,29 +38,24 @@ def render(scene, *, write_still=False):
             if generated and not obj.hide_render:
                 hidden.append((obj, obj.hide_render))
                 obj.hide_render = True
-        line = gpu_render.render_lines(scene, capture=True)
-        if line['status'] == 'cancelled':
-            return line
-        buffers = line.pop('views', None)
-        if buffers is None:
-            buffers = {'': line.pop('pixels')}
-        height, width = next(iter(buffers.values())).shape[:2]
-        texture_limit = line.get('gpu_texture_limit')
-        if texture_limit and max(width,height) > texture_limit:
-            # EEVEE/Workbench allocate full-frame GPU buffers. EEVEE can
-            # return a saved image with no beauty pass when this check fails.
-            if scene.render.engine != 'CYCLES':
-                raise ValueError(
-                    f'{width} × {height} 장면이 Blender 렌더 엔진의 GPU 텍스처 한도 '
-                    f'({texture_limit}px)를 초과합니다. Cycles로 합성하거나 GPU 라인만 렌더하세요.')
-        if cpu_render or (texture_limit and max(width,height) > texture_limit):
-            flags['compositor_device'] = scene.render.compositor_device
-            scene.render.compositor_device = 'CPU'
-        scene.use_nodes = True
-        graph = scene.node_tree
+        if modern:
+            temporary_group = (original_group.copy() if original_group else
+                               bpy.data.node_groups.new('.REA temporary composite', 'CompositorNodeTree'))
+            graph = temporary_group
+            scene.compositing_node_group = graph
+        else:
+            scene.use_nodes = True
+            graph = scene.node_tree
+        layers = {layer.name for layer in scene.view_layers if layer.use}
+        if not layers:
+            raise ValueError('렌더할 뷰 레이어를 활성화하세요')
+        first_layer = scene.view_layers[0].name
         if old_nodes:
             sources = [n for n in graph.nodes if n.bl_idname == 'CompositorNodeRLayers'
-                and (n.scene is None or n.scene == scene) and n.layer in ('', scene.view_layers[0].name)]
+                and (n.scene is None or n.scene == scene) and (n.layer or first_layer) in layers]
+            linked_sources = [n for n in sources if n.outputs['Image'].is_linked]
+            if linked_sources:
+                sources = linked_sources
             if not sources:
                 raise ValueError('REA 선 합성에는 현재 장면의 Render Layers 노드가 필요합니다')
         else:
@@ -77,37 +75,74 @@ def render(scene, *, write_still=False):
                     for link in list(node.inputs['Image'].links):
                         graph.links.remove(link)
             source = graph.nodes.new('CompositorNodeRLayers')
-            source.layer = scene.view_layers[0].name
-            outputs = [n for n in graph.nodes if n.bl_idname == 'CompositorNodeComposite']
-            if not outputs:
-                outputs = [graph.nodes.new('CompositorNodeComposite')]
+            source.layer = next(layer.name for layer in scene.view_layers if layer.use)
+            if modern:
+                graph.interface.new_socket(name='Image', in_out='OUTPUT', socket_type='NodeSocketColor')
+                outputs = [graph.nodes.new('NodeGroupOutput')]
+            else:
+                outputs = [n for n in graph.nodes if n.bl_idname == 'CompositorNodeComposite']
+                if not outputs:
+                    outputs = [graph.nodes.new('CompositorNodeComposite')]
             for node in outputs:
                 graph.links.new(source.outputs['Image'], node.inputs['Image'])
             sources = [source]
-        switch = None
-        if len(buffers)>1:
-            with bpy.context.temp_override(scene=scene):
-                switch = graph.nodes.new('CompositorNodeSwitchView')
-        for view in tuple(buffers):
-            pixels = buffers.pop(view)
-            name = f".REA {line['line_backend']} line composite {view}".rstrip()
-            image = bpy.data.images.new(name, width=width, height=height, alpha=True, float_buffer=True)
-            images.append(image)
-            image.alpha_mode = 'PREMUL'
-            image.pixels.foreach_set(pixels.ravel())
-            image.update()
-            del pixels
-            ink = graph.nodes.new('CompositorNodeImage')
-            ink.image = image
-            if switch is not None:
-                graph.links.new(ink.outputs['Image'], switch.inputs[view])
-        ink_output = (switch if switch is not None else ink).outputs['Image']
+        ink_outputs = {}
+        line_seconds = 0.
+        line_warnings = []
+        for layer_name in dict.fromkeys(source.layer or first_layer for source in sources):
+            options = {'layer': layer_name} if len(scene.view_layers) > 1 else {}
+            line = gpu_render.render_lines(scene, capture=True, **options)
+            if line['status'] == 'cancelled':
+                return line
+            if options and line.get('view_layer') != layer_name:
+                raise RuntimeError(f'REA 선 패스의 뷰 레이어가 일치하지 않습니다: {layer_name}')
+            line_seconds += line['seconds']
+            line_warnings.extend(line['warnings'])
+            buffers = line.pop('views', None)
+            if buffers is None:
+                buffers = {'': line.pop('pixels')}
+            height, width = next(iter(buffers.values())).shape[:2]
+            texture_limit = line.get('gpu_texture_limit')
+            exceeds_limit = texture_limit and max(width, height) > texture_limit
+            if exceeds_limit and scene.render.engine != 'CYCLES':
+                raise ValueError(
+                    f'{width} × {height} 장면이 Blender 렌더 엔진의 GPU 텍스처 한도 '
+                    f'({texture_limit}px)를 초과합니다. Cycles로 합성하거나 GPU 라인만 렌더하세요.')
+            if (cpu_render or exceeds_limit) and 'compositor_device' not in flags:
+                flags['compositor_device'] = scene.render.compositor_device
+                scene.render.compositor_device = 'CPU'
+            switch = None
+            if len(buffers)>1:
+                with bpy.context.temp_override(scene=scene):
+                    switch = graph.nodes.new('CompositorNodeSwitchView')
+            for view in tuple(buffers):
+                pixels = buffers.pop(view)
+                name = f".REA {line['line_backend']} line composite {layer_name} {view}".rstrip()
+                image = bpy.data.images.new(name, width=width, height=height, alpha=True, float_buffer=True)
+                images.append(image)
+                image.alpha_mode = 'PREMUL'
+                image.pixels.foreach_set(pixels.ravel())
+                image.update()
+                del pixels
+                ink = graph.nodes.new('CompositorNodeImage')
+                ink.image = image
+                if switch is not None:
+                    graph.links.new(ink.outputs['Image'], switch.inputs[view])
+            ink_output = (switch if switch is not None else ink).outputs['Image']
+            ink_outputs[layer_name] = ink_output
         for source in sources:
+            ink_output = ink_outputs[source.layer or first_layer]
             outgoing = [(l.from_socket, l.to_socket) for l in source.outputs['Image'].links]
             over = graph.nodes.new('CompositorNodeAlphaOver')
-            over.inputs[0].default_value = 1.
-            graph.links.new(source.outputs['Image'], over.inputs[1])
-            graph.links.new(ink_output, over.inputs[2])
+            if modern:
+                over.inputs['Factor'].default_value = 1.
+                over.inputs['Straight Alpha'].default_value = False
+                graph.links.new(source.outputs['Image'], over.inputs['Background'])
+                graph.links.new(ink_output, over.inputs['Foreground'])
+            else:
+                over.inputs[0].default_value = 1.
+                graph.links.new(source.outputs['Image'], over.inputs[1])
+                graph.links.new(ink_output, over.inputs[2])
             for a, b in outgoing:
                 if source.as_pointer() in original_ids:
                     rewired.append((a, b))
@@ -119,11 +154,15 @@ def render(scene, *, write_still=False):
             scene.cycles.device = 'CPU'
         operation = _render_beauty(scene, write_still)
         return {'status': 'cancelled' if 'CANCELLED' in operation else 'ok',
-                'seconds': time.perf_counter()-started, 'line_seconds': line['seconds'],
+                'seconds': time.perf_counter()-started, 'line_seconds': line_seconds,
                 'line_backend': line['line_backend'],
-                'warnings': line['warnings'], 'excluded_line_helpers': [o.name for o, _ in hidden]}
+                'warnings': list(dict.fromkeys(line_warnings)), 'excluded_line_helpers': [o.name for o, _ in hidden]}
     finally:
-        if scene.node_tree:
+        if modern:
+            if temporary_group is not None:
+                scene.compositing_node_group = original_group
+                bpy.data.node_groups.remove(temporary_group)
+        elif scene.node_tree:
             graph = scene.node_tree
             for node in list(graph.nodes):
                 if node.as_pointer() not in original_ids:
@@ -142,6 +181,7 @@ def render(scene, *, write_still=False):
             setattr(scene.render, k, value)
         if cycles_device is not None:
             scene.cycles.device = cycles_device
-        scene.use_nodes = old_nodes
+        if not modern:
+            scene.use_nodes = old_nodes
         with ui.suspend_sync():
             scene.lea_line.auto_sync = old_auto

@@ -13,6 +13,8 @@ struct Style {
     aa: f32,
     rgba: [f32; 4],
     max_stroke_size: f32,
+    wave: Vec3,
+    dash: Vec3,
 }
 
 #[repr(C)]
@@ -67,6 +69,8 @@ pub struct StyleInput {
     stamp_period: f32,
     reduction: [ReductionInput; 2],
     stroke_curves: [*const f32; 2],
+    wave: Vec3,
+    dash: Vec3,
 }
 
 #[repr(C)]
@@ -93,6 +97,8 @@ pub struct Mesh {
     style_count: usize,
     marks: *const u8,
     world: [[f32; 4]; 3],
+    face_masks: *const *const u8,
+    face_materials: *const i32,
 }
 
 pub struct Frame {
@@ -112,6 +118,7 @@ struct Stroke {
     a: Vec3,
     b: Vec3,
     outside: f32,
+    directed_wave_side: f32,
     owner: u32,
     exterior_only: bool,
 }
@@ -154,11 +161,18 @@ struct StampSpan {
     end: f32,
     caps: [bool; 2],
     total: f32,
+    next: Option<usize>,
+    directed_wave_side: f32,
+}
+
+struct WaveRun {
+    bounds: [f32; 2],
+    phase_origin: f32,
 }
 
 const CUT_VERTEX: u32 = u32::MAX;
 
-fn stamp_spans(lines: &[Stroke], endpoints: &[[u32; 2]], vertex_count: usize) -> Vec<StampSpan> {
+fn stamp_spans(lines: &[Stroke], endpoints: &[[u32; 2]], vertex_count: usize, wave_direction: Option<f32>, counterclockwise: bool, loop_start: u32) -> Vec<StampSpan> {
     const NONE: usize = usize::MAX;
     const BRANCH: usize = usize::MAX-1;
     let mut links = vec![[NONE; 2]; vertex_count];
@@ -177,10 +191,12 @@ fn stamp_spans(lines: &[Stroke], endpoints: &[[u32; 2]], vertex_count: usize) ->
         let [first, second] = links[vertex as usize];
         if second >= BRANCH { NONE } else if first == half { second } else { first }
     };
-    let empty = StampSpan {start:f32::NAN,end:0.0,caps:[true;2],total:0.};
+    let empty = StampSpan {start:f32::NAN,end:0.0,caps:[true;2],total:0.,next:None,directed_wave_side:0.};
     let mut spans = vec![empty; lines.len()];
+    let (sin, cos) = wave_direction.unwrap_or(DEFAULT_WAVE_DIRECTION).sin_cos();
     let mut chain = Vec::new();
     let mut walk = |mut half: usize| {
+        let first_half = half;
         chain.clear();
         let mut distance = 0.0;
         while half != NONE {
@@ -192,13 +208,99 @@ fn stamp_spans(lines: &[Stroke], endpoints: &[[u32; 2]], vertex_count: usize) ->
             let delta = minus(lines[edge].b,lines[edge].a);
             let length = (delta[0]*delta[0]+delta[1]*delta[1]).sqrt();
             let end = distance+length;
-            spans[edge] = if side==0 { StampSpan {start:distance,end,caps,total:0.} }
-                          else { StampSpan {start:end,end:distance,caps,total:0.} };
+            if let Some(&previous) = chain.last() {
+                let previous: &mut StampSpan = &mut spans[previous];
+                previous.next = Some(edge);
+            }
+            spans[edge] = if side==0 { StampSpan {start:distance,end,caps,total:0.,next:None,directed_wave_side:0.} }
+                          else { StampSpan {start:end,end:distance,caps,total:0.,next:None,directed_wave_side:0.} };
             chain.push(edge);
             distance = end;
             half = neighbor(endpoints[edge][1-side],2*edge+1-side);
         }
-        for &edge in &chain { spans[edge].total = distance; }
+        let Some(&head) = chain.first() else { return; };
+        let tail = *chain.last().unwrap();
+        let start_side = usize::from(spans[head].start > spans[head].end);
+        let end_side = usize::from(spans[tail].start < spans[tail].end);
+        let start_vertex = endpoints[head][start_side];
+        let end_vertex = endpoints[tail][end_side];
+        let terminal = |vertex: u32| vertex != CUT_VERTEX && links[vertex as usize][1] == NONE;
+        let open_directed_wave = terminal(start_vertex) && terminal(end_vertex)
+            && chain.iter().all(|&edge| lines[edge].directed_wave_side != 0.);
+        if open_directed_wave {
+            let start = if start_side == 0 { lines[head].a } else { lines[head].b };
+            let end = if end_side == 0 { lines[tail].a } else { lines[tail].b };
+            // Convert the authored image Y-down angle to the Y-up raster.
+            let delta = minus(end, start);
+            let projection = delta[0] * cos - delta[1] * sin;
+            let threshold = if wave_direction.is_some() { 0.00005 } else { -0.00005 };
+            if projection < threshold {
+                chain.reverse();
+                for (position, &edge) in chain.iter().enumerate() {
+                    let span = &mut spans[edge];
+                    span.start = distance - span.start;
+                    span.end = distance - span.end;
+                    span.next = chain.get(position + 1).copied();
+                }
+            }
+        }
+        let closed_directed_wave = wave_direction.is_some() && half == first_half
+            && chain.iter().all(|&edge| lines[edge].directed_wave_side != 0.);
+        if closed_directed_wave {
+            let mut lo = [f32::INFINITY; 2];
+            let mut hi = [f32::NEG_INFINITY; 2];
+            let origin = lines[head].a;
+            let mut area = 0.;
+            for &edge in &chain {
+                let line = lines[edge];
+                for k in 0..2 {
+                    lo[k] = lo[k].min(line.a[k]).min(line.b[k]);
+                    hi[k] = hi[k].max(line.a[k]).max(line.b[k]);
+                }
+                let a = minus(line.a, origin);
+                let b = minus(line.b, origin);
+                let cross = a[0]*b[1]-a[1]*b[0];
+                area += if spans[edge].start < spans[edge].end { cross } else { -cross };
+            }
+            let axis = [cos*(hi[0]-lo[0]), -sin*(hi[1]-lo[1])];
+            let reverse = (area > 0.) != counterclockwise;
+            let score = |edge: usize| {
+                let line = lines[edge];
+                let forward = (spans[edge].start < spans[edge].end) != reverse;
+                let [x,y,_] = if forward { line.a } else { line.b };
+                match loop_start {
+                    1 => [x,y],
+                    2 => [-x,y],
+                    3 => [y,x],
+                    4 => [-y,x],
+                    _ => [(line.a[0]+line.b[0])*axis[0]+(line.a[1]+line.b[1])*axis[1],0.],
+                }
+            };
+            if reverse { chain.reverse(); }
+            let anchor = (0..chain.len()).min_by(|&a,&b| {
+                let [ax,ay] = score(chain[a]);
+                let [bx,by] = score(chain[b]);
+                ax.total_cmp(&bx).then(ay.total_cmp(&by)).then(chain[a].cmp(&chain[b]))
+            }).unwrap();
+            chain.rotate_left(anchor);
+            let mut position = 0.;
+            for (index, &edge) in chain.iter().enumerate() {
+                let span = &mut spans[edge];
+                let length = (span.end-span.start).abs();
+                let forward = (span.start < span.end) != reverse;
+                let end = position + length;
+                (span.start, span.end) = if forward { (position, end) } else { (end, position) };
+                span.next = chain.get(index+1).copied();
+                position = end;
+            }
+            distance = position;
+        }
+        for &edge in &chain {
+            spans[edge].total = distance;
+            if open_directed_wave || closed_directed_wave {
+                spans[edge].directed_wave_side = lines[edge].directed_wave_side;
+            }
+        }
     };
     // Open strokes start at the lower terminal vertex, matching the GPU's
     // default orientation. A branch is a terminal for each of its edges.
@@ -222,14 +324,14 @@ mod chain_tests {
     use super::*;
 
     fn line(a: [f32; 2], b: [f32; 2]) -> Stroke {
-        Stroke { a:[a[0],a[1],0.5], b:[b[0],b[1],0.5], outside:1.0,
+        Stroke { a:[a[0],a[1],0.5], b:[b[0],b[1],0.5], outside:1.0, directed_wave_side:0.,
                  owner:1, exterior_only:true }
     }
 
     #[test]
     fn reversed_edges_preserve_continuous_distance_from_terminal() {
         let lines = [line([3.,4.],[3.,0.]), line([0.,0.],[3.,0.])];
-        let spans = stamp_spans(&lines, &[[2,1],[0,1]], 3);
+        let spans = stamp_spans(&lines, &[[2,1],[0,1]], 3, None, false, 0);
         assert_eq!((spans[1].start,spans[1].end), (0.,3.));
         assert_eq!((spans[0].start,spans[0].end), (7.,3.));
         assert_eq!(spans[1].caps,[true,false]);
@@ -237,10 +339,48 @@ mod chain_tests {
     }
 
     #[test]
+    fn perspective_marked_wave_reverses_at_projected_terminal() {
+        let mut lines = [line([0.,0.],[0.,-3.]), line([0.,-3.],[0.,-7.])];
+        for line in &mut lines { line.directed_wave_side = -1.; }
+        let spans = stamp_spans(&lines, &[[0,1],[1,2]], 3, None, false, 0);
+        assert_eq!((spans[1].start, spans[1].end, spans[1].next), (4., 0., Some(0)));
+        assert_eq!((spans[0].start, spans[0].end, spans[0].next), (7., 4., None));
+        assert_eq!(spans[0].directed_wave_side, -1.);
+    }
+
+    #[test]
+    fn custom_wave_angle_changes_the_open_chain_start() {
+        let mut lines = [line([0.,0.],[1.,2.]), line([1.,2.],[2.,4.])];
+        for line in &mut lines { line.directed_wave_side = -1.; }
+        let endpoints = [[0,1],[1,2]];
+        let forward = stamp_spans(&lines, &endpoints, 3, Some(0.), false, 0);
+        let reverse = stamp_spans(&lines, &endpoints, 3, Some(std::f32::consts::FRAC_PI_6), false, 0);
+        assert_eq!(forward[0].start, 0.);
+        assert_eq!(forward[0].next, Some(1));
+        assert_eq!(reverse[1].end, 0.);
+        assert_eq!(reverse[1].next, Some(0));
+        assert_eq!(reverse[0].directed_wave_side, -1.);
+    }
+
+    #[test]
+    fn closed_wave_winding_uses_opposite_ends_of_the_same_edge() {
+        let mut lines = [line([0.,0.],[3.,0.]), line([3.,0.],[3.,4.]),
+                         line([3.,4.],[0.,4.]), line([0.,4.],[0.,0.])];
+        for line in &mut lines { line.directed_wave_side = 1.; }
+        let endpoints = [[0,1],[1,2],[2,3],[3,0]];
+        let clockwise = stamp_spans(&lines, &endpoints, 4, Some(0.), false, 0);
+        let counterclockwise = stamp_spans(&lines, &endpoints, 4, Some(0.), true, 0);
+        assert_eq!((clockwise[3].start, clockwise[3].end), (4., 0.));
+        assert_eq!((counterclockwise[3].start, counterclockwise[3].end), (0., 4.));
+        assert_eq!(clockwise[3].caps, [false, false]);
+        assert_eq!(counterclockwise[3].caps, [false, false]);
+    }
+
+    #[test]
     fn closed_loop_accumulates_exactly_one_perimeter_without_caps() {
         let lines = [line([0.,0.],[3.,0.]),line([3.,0.],[3.,4.]),
                      line([3.,4.],[0.,4.]),line([0.,4.],[0.,0.])];
-        let spans = stamp_spans(&lines,&[[0,1],[1,2],[2,3],[3,0]],4);
+        let spans = stamp_spans(&lines,&[[0,1],[1,2],[2,3],[3,0]],4, None, false, 0);
         let mut previous = 0.;
         for span in spans {
             assert_eq!(span.start,previous);
@@ -254,7 +394,7 @@ mod chain_tests {
     fn branches_and_clipped_endpoints_do_not_join_unrelated_runs() {
         let lines = [line([0.,0.],[1.,0.]),line([0.,0.],[0.,2.]),
                      line([0.,0.],[-3.,0.]),line([4.,0.],[6.,0.])];
-        let spans = stamp_spans(&lines,&[[0,1],[0,2],[0,3],[CUT_VERTEX,CUT_VERTEX]],4);
+        let spans = stamp_spans(&lines,&[[0,1],[0,2],[0,3],[CUT_VERTEX,CUT_VERTEX]],4, None, false, 0);
         for (span,length) in spans.iter().zip([1.,2.,3.,2.]) {
             assert_eq!(span.start.min(span.end),0.);
             assert_eq!((span.end-span.start).abs(),length);
@@ -269,6 +409,13 @@ const CREASE: u32 = 4;
 const RESERVE_OUTLINE: u32 = 8;
 const MARK: u32 = 16;
 const EXCLUDE_MARK: u32 = 32;
+const MATERIAL: u32 = 64;
+const EXCLUDE_MATERIAL: u32 = 128;
+const HIDDEN: u32 = 256;
+// When set, dash[2] carries the Wave angle and the dash gap is zero.
+const WAVE_DIRECTION: u32 = 512;
+const WAVE_COUNTERCLOCKWISE: u32 = 1024;
+const DEFAULT_WAVE_DIRECTION: f32 = -std::f32::consts::FRAC_PI_6;
 const EMPTY: u64 = (1.0f32.to_bits() as u64) << 32 | u32::MAX as u64;
 const DEPTH_BIAS: f32 = 0.000002;
 
@@ -414,7 +561,7 @@ impl Frame {
     }
 
     fn stroke(&self, line: Stroke, index: usize, rect: [usize; 4], output: &mut [[f32; 4]],
-              span: Option<&StampSpan>, world: Option<&[Clip; 2]>) {
+              span: Option<&StampSpan>, world: Option<&[Clip; 2]>, wave_runs: Option<&[WaveRun]>) {
         let style = self.styles[index];
         let reduction = &self.reductions[index];
         let profiles = &self.stroke_curves[index];
@@ -429,15 +576,25 @@ impl Frame {
         let aa = style.aa.min(1.0);
         let max_radius = style.radius * style.max_stroke_size * reduction[0].as_ref().map_or(1., Reduction::max_factor);
         let reach = max_radius+aa*0.5;
+        let length = length_sq * inv_length;
         let axis = usize::from(d[0].abs() < d[1].abs());
         let cross = 1-axis;
         let lower = [left,bottom];
         let upper = [right,top];
         let width = right-left;
-        let scan_range = range(a[axis].min(line.b[axis])-reach,a[axis].max(line.b[axis])+reach,upper[axis]);
-        let perpendicular_reach = reach/(d[axis].abs()*inv_length);
+        let scan_reach = reach + style.wave[0].abs();
+        let scan_range = range(a[axis].min(line.b[axis])-scan_reach,a[axis].max(line.b[axis])+scan_reach,upper[axis]);
+        let perpendicular_reach = scan_reach/(d[axis].abs()*inv_length);
         let inv_d = d[axis].recip();
         let inv_len_sq = length_sq.recip();
+        let hidden = style.flags & HIDDEN != 0;
+        let round_cuts = line.outside == 0.
+            && style.flags & (OUTLINE | BORDER | MARK) == 0
+            && style.flags & (CREASE | MATERIAL) != 0
+            && style.wave[0] == 0. && style.dash[1] == 0.
+            && stamp.is_none() && span.is_none() && world.is_none()
+            && length <= 4. * self.width.max(self.height) as f32;
+        let mut cut_runs = None;
         for i in scan_range.start.max(lower[axis])..scan_range.end {
             let scan = i as f32+0.5-a[axis];
             let middle = a[cross]+(scan*inv_d).clamp(0.0,1.0)*d[cross];
@@ -448,10 +605,63 @@ impl Frame {
                 let t = projected.clamp(0.0,1.0);
                 let dx = scan-t*d[axis];
                 let dy = other-t*d[cross];
-                let distance_sq = dx*dx+dy*dy;
+                let mut distance_sq = dx*dx+dy*dy;
+                let (x,y) = if axis == 0 {(i,j)} else {(j,i)};
+                let mut across = 0.;
+                if stamp.is_some() || style.wave[0] != 0. || style.dash[1] > 0. {
+                    across = (-d[1]*(x as f32+0.5-a[0])+d[0]*(y as f32+0.5-a[1]))*inv_length;
+                }
+                if let Some(span) = span {
+                    if style.wave[0] != 0. {
+                        let side = if line.outside != 0. { line.outside }
+                            else if span.start <= span.end { 1. } else { -1. };
+                        let position = projected * length;
+                        if let Some(runs) = wave_runs {
+                            distance_sq = reach * reach;
+                            let start = runs.partition_point(|run| run.bounds[1] < position-reach);
+                            let original_cross = across;
+                            for run in &runs[start..] {
+                                if run.bounds[0] > position+reach { break; }
+                                let distance = wave_distance(position, original_cross, length, reach,
+                                    span, style.wave, side, run.bounds, run.phase_origin);
+                                if distance.0 < distance_sq {
+                                    (distance_sq, across) = distance;
+                                }
+                            }
+                        } else {
+                            let side = if span.directed_wave_side != 0. { span.directed_wave_side } else { side };
+                            (distance_sq, across) = wave_distance(position, across, length, reach,
+                                span, style.wave, side, [0., length], 0.);
+                        }
+                    }
+                    let [dash, gap, phase] = style.dash;
+                    if gap > 0. {
+                        let along = span.start + t*(span.end-span.start);
+                        let cycle = (along + phase).rem_euclid(dash + gap);
+                        if cycle > dash {
+                            let overrun = (projected-t).abs()*length;
+                            let offset = (cycle-dash).min(dash+gap-cycle).max(overrun);
+                            distance_sq = across*across + offset*offset;
+                        }
+                    }
+                }
                 if distance_sq >= reach*reach { continue; }
                 let center = [a[0]+t*d[0],a[1]+t*d[1],a[2]+t*d[2]];
-                if !self.visible(center,outward,line.owner) { continue; }
+                if wave_runs.is_none() && self.visible(center, outward, line.owner) == hidden {
+                    if !round_cuts { continue; }
+                    let runs = cut_runs.get_or_insert_with(||
+                        self.depth_runs(line, d, outward, length, hidden));
+                    let position = projected * length;
+                    let start = runs.partition_point(|run| run[1] < position-reach);
+                    let mut closest = reach * reach;
+                    for &[lo, hi] in &runs[start..] {
+                        if lo > position+reach { break; }
+                        let end = position.clamp(lo, hi)/length;
+                        closest = closest.min((scan-end*d[axis]).powi(2)
+                                              + (other-end*d[cross]).powi(2));
+                    }
+                    distance_sq = closest;
+                }
                 // An Outline is an exterior contour, not every front/back
                 // transition inside the same mesh (for example a dish rim).
                 // Keep independent open borders and crease/marked strokes.
@@ -482,11 +692,9 @@ impl Frame {
                 }
                 let coverage = if aa == 0.0 { 1.0 }
                     else { (0.5+(radius-distance_sq.sqrt())/aa).clamp(0.0,1.0) };
-                let (x,y) = if axis == 0 {(i,j)} else {(j,i)};
                 let mut alpha = coverage*opacity;
                 if let (Some(stamp), Some(span)) = (stamp, span) {
                     if (projected<0.0 && !span.caps[0]) || (projected>=1.0 && !span.caps[1]) { continue; }
-                    let across = (-d[1]*(x as f32+0.5-a[0])+d[0]*(y as f32+0.5-a[1]))*inv_length;
                     let side = if span.start <= span.end {1.0} else {-1.0};
                     alpha *= stamp.sample(span.start+projected*(span.end-span.start), across*side, 2.0*radius);
                     if alpha <= 0.0 { continue; }
@@ -499,6 +707,129 @@ impl Frame {
             }
         }
     }
+
+    fn depth_runs(&self, line: Stroke, delta: Vec3, outward: [f32; 2],
+                  length: f32, hidden: bool) -> Vec<[f32; 2]> {
+        let visible = |t: f32| {
+            self.visible(std::array::from_fn(|i| line.a[i] + delta[i]*t), outward, line.owner)
+                != hidden
+        };
+        let steps = (2. * length).ceil().max(1.) as usize;
+        let mut runs = Vec::new();
+        let mut previous = visible(0.);
+        let mut start = 0.;
+        for i in 1..=steps {
+            let mut high = i as f32 / steps as f32;
+            let current = visible(high);
+            if current == previous { continue; }
+            let mut low = (i-1) as f32 / steps as f32;
+            for _ in 0..10 {
+                let mid = (low+high)*0.5;
+                if visible(mid) == previous { low = mid; } else { high = mid; }
+            }
+            let cut = (low+high)*0.5*length;
+            if previous { runs.push([start, cut]); } else { start = cut; }
+            previous = current;
+        }
+        if previous { runs.push([start, length]); }
+        runs
+    }
+
+    fn chain_wave_runs(&self, ink: &[Stroke], spans: &[StampSpan],
+                       allow_shallow_turns: bool, hidden: bool) -> Vec<Option<Vec<WaveRun>>> {
+        let mut result: Vec<Option<Vec<WaveRun>>> = (0..ink.len()).map(|_| None).collect();
+        for (head, first) in spans.iter().enumerate() {
+            let head_side = usize::from(first.start > first.end);
+            if first.start.min(first.end) != 0. || !first.caps[head_side]
+                || first.total > 4. * self.width.max(self.height) as f32 { continue; }
+            let direction = |index: usize| {
+                let d = minus(ink[index].b, ink[index].a);
+                let length = d[0].hypot(d[1]);
+                let sign = if spans[index].start <= spans[index].end { 1. } else { -1. };
+                [d[0]*sign/length, d[1]*sign/length]
+            };
+            let tangent = direction(head);
+            let mut cursor = Some(head);
+            let mut chain = Vec::new();
+            while let Some(index) = cursor {
+                let axis = direction(index);
+                // Restrict the phase transfer to shallow turns whose
+                // displaced stroke remains continuous at the shared vertex.
+                let turns_too_far = if allow_shallow_turns {
+                    axis[0]*tangent[0] + axis[1]*tangent[1] < 0.85
+                } else {
+                    (axis[0]-tangent[0]).abs() > 1e-4 || (axis[1]-tangent[1]).abs() > 1e-4
+                };
+                if turns_too_far {
+                    chain.clear();
+                    break;
+                }
+                chain.push(index);
+                cursor = spans[index].next;
+            }
+            let mut phase_origin = 0.;
+            let mut continues = false;
+            let mut has_cut = false;
+            for &index in &chain {
+                let span = &spans[index];
+                let line = ink[index];
+                let delta = minus(line.b, line.a);
+                let length = delta[0].hypot(delta[1]);
+                let outward = [-delta[1]*line.outside/length, delta[0]*line.outside/length];
+                let mut runs = self.depth_runs(line, delta, outward, length, hidden);
+                has_cut |= runs.as_slice() != [[0., length]];
+                let forward = span.start <= span.end;
+                if !forward { runs.reverse(); }
+                let mut resolved = Vec::new();
+                for bounds in runs {
+                    let (entry, exit) = if forward { (bounds[0], bounds[1]) }
+                                        else { (length-bounds[1], length-bounds[0]) };
+                    if !continues || entry > 0. {
+                        phase_origin = span.start.min(span.end) + entry;
+                    }
+                    resolved.push(WaveRun { bounds, phase_origin });
+                    continues = exit == length;
+                }
+                if resolved.is_empty() { continues = false; }
+                if !forward { resolved.reverse(); }
+                result[index] = Some(resolved);
+            }
+            if !has_cut {
+                for index in chain { result[index] = None; }
+            }
+        }
+        result
+    }
+}
+
+fn wave_distance(x: f32, y: f32, length: f32, reach: f32, span: &StampSpan,
+                 wave: Vec3, side: f32, run: [f32; 2], origin: f32) -> (f32, f32) {
+    let [amplitude, wavelength, phase] = wave;
+    let low = (x-reach).max(run[0]);
+    let high = (x+reach).min(run[1]);
+    if high < low || y.abs() > amplitude.abs()+reach { return (reach*reach, y); }
+    let height = |at: f32| {
+        let along = span.start - origin + at/length*(span.end-span.start);
+        side * amplitude * (std::f32::consts::TAU*along/wavelength + phase).sin()
+    };
+    let steps = ((high-low) / (wavelength/8.).min(1.)).ceil().clamp(1., 64.) as usize;
+    let (mut ax, mut ay) = (low, height(low));
+    let (mut best, mut cross) = (reach*reach, y);
+    for step in 1..=steps {
+        let bx = low + (high-low)*step as f32/steps as f32;
+        let by = height(bx);
+        let (dx, dy) = (bx-ax, by-ay);
+        let span_sq = dx*dx+dy*dy;
+        let t = (((x-ax)*dx+(y-ay)*dy)/span_sq.max(1e-12)).clamp(0., 1.);
+        let (sx, sy) = (x-ax-t*dx, y-ay-t*dy);
+        let distance = sx*sx+sy*sy;
+        if distance < best {
+            best = distance;
+            cross = if span_sq > 1e-12 { (sy*dx-sx*dy)/span_sq.sqrt() } else { sy };
+        }
+        (ax, ay) = (bx, by);
+    }
+    (best, cross)
 }
 
 fn interior_backing(owner: u32, backing: f32, backing_owner: u32) -> bool {
@@ -561,6 +892,13 @@ unsafe fn prepare(frame: &Frame, mesh: &Mesh) -> Option<Ink> {
     let vertices = slice::from_raw_parts(mesh.vertices,mesh.vertex_count);
     let triangles = slice::from_raw_parts(mesh.triangles,mesh.triangle_count);
     let jobs = slice::from_raw_parts(mesh.style_ids,mesh.style_count);
+    let face_masks: Vec<_> = if mesh.face_masks.is_null() {
+        Vec::new()
+    } else {
+        slice::from_raw_parts(mesh.face_masks, jobs.len()).iter().map(|&mask| {
+            (!mask.is_null()).then(|| slice::from_raw_parts(mask, mesh.face_count))
+        }).collect()
+    };
     let size = [frame.width as f32,frame.height as f32];
     let mut clips = Vec::with_capacity(vertices.len());
     let mut projected = Vec::with_capacity(vertices.len());
@@ -586,6 +924,8 @@ unsafe fn prepare(frame: &Frame, mesh: &Mesh) -> Option<Ink> {
     if jobs.is_empty() { return Some(ink); }
     let edges = slice::from_raw_parts(mesh.edges,mesh.edge_count);
     let marks = (!mesh.marks.is_null()).then(|| slice::from_raw_parts(mesh.marks,mesh.edge_count));
+    let materials = (!mesh.face_materials.is_null())
+        .then(|| slice::from_raw_parts(mesh.face_materials, mesh.face_count));
     let mut stamp_edges = vec![Vec::new(); frame.styles.len()];
     let loop_edges = slice::from_raw_parts(mesh.loop_edges,mesh.loop_count);
     let loop_vertices = slice::from_raw_parts(mesh.loop_vertices,mesh.loop_count);
@@ -645,21 +985,34 @@ unsafe fn prepare(frame: &Frame, mesh: &Mesh) -> Option<Ink> {
         }
         let silhouette = front_face.is_some() && back_face;
         let marked = second.is_some() && marks.is_some_and(|values| values[index]!=0);
-        for &job in jobs {
+        for (slot, &job) in jobs.iter().enumerate() {
             let style = frame.styles[job as usize];
+            let selected = face_masks.get(slot).copied().flatten();
             let chained = frame.stamps[job as usize].is_some()
+                || style.wave[0] != 0. || style.dash[1] > 0.
                 || frame.stroke_curves[job as usize].iter().any(Option::is_some);
             // Offscreen strokes can still contribute to a texture's phase.
             if outside_frame != 0 && !chained { continue; }
             let contour = silhouette && style.flags&OUTLINE != 0;
             let boundary = second.is_none() && style.flags&BORDER != 0;
+            let material_edge = style.flags & (MATERIAL | EXCLUDE_MATERIAL) != 0
+                && second.is_some_and(|other| {
+                    materials.is_some_and(|ids| {
+                        any_face_pair(first, other, neighbors.extra, &extra, selected,
+                                      |a, b| ids[a] != ids[b])
+                    })
+                });
+            let material = material_edge && style.flags&MATERIAL != 0
+                && !(silhouette && style.flags&RESERVE_OUTLINE != 0);
+            if material_edge && style.flags&EXCLUDE_MATERIAL != 0 { continue; }
             let mark = marked && style.flags&MARK != 0
                 && !(silhouette && style.flags&RESERVE_OUTLINE != 0);
             let crease = second.is_some() && style.flags&CREASE != 0
                 && !(marked && style.flags&EXCLUDE_MARK != 0)
                 && !(silhouette && style.flags&RESERVE_OUTLINE != 0)
-                && has_crease(first, second.unwrap(), neighbors.extra, &extra, &directions, style);
-            if !(contour || boundary || crease || mark) { continue; }
+                && has_crease(first, second.unwrap(), neighbors.extra, &extra, &directions,
+                              style, selected);
+            if !(contour || boundary || crease || mark || material) { continue; }
             let outside = if (contour || boundary) && front_face.is_some() {
                 if front_face.unwrap().forward {-mesh.handedness} else {mesh.handedness}
             } else { 0.0 };
@@ -698,8 +1051,27 @@ unsafe fn prepare(frame: &Frame, mesh: &Mesh) -> Option<Ink> {
                 world[1][3] = right[3].recip();
                 ink.reduction_points[job as usize].push(world);
             }
-            ink.strokes[job as usize].push(Stroke {a:p,b:q,outside,owner:mesh.owner,
-                exterior_only:contour && !boundary && !crease && !mark});
+            let directed_mark = style.wave[0] != 0.
+                && (mesh.perspective != 0 || style.flags & WAVE_DIRECTION != 0)
+                && mark && style.flags & (OUTLINE | BORDER | CREASE | MATERIAL | HIDDEN) == 0
+                && neighbors.extra == 0 && second.is_some_and(|other| {
+                    let delta = minus(directions[first.face], directions[other.face]);
+                    dot(delta, delta) <= 1e-12
+                });
+            let directed_contour = style.flags & WAVE_DIRECTION != 0 && (contour || crease);
+            let directed_wave_side = if style.wave[0] != 0. && (directed_mark || directed_contour) {
+                let face = if directed_contour {
+                    let eye = if mesh.perspective != 0 { minus(mesh.eye, vertices[a]) } else { mesh.eye };
+                    let world_eye = mesh.world.map(|row| dot([row[0], row[1], row[2]], eye));
+                    second.filter(|other| {
+                        let difference = minus(directions[other.face], directions[first.face]);
+                        dot(difference, world_eye) > 1e-6 * dot(world_eye, world_eye).sqrt()
+                    }).unwrap_or(first)
+                } else { first };
+                if face.forward == directed_mark { mesh.handedness } else { -mesh.handedness }
+            } else { 0. };
+            ink.strokes[job as usize].push(Stroke {a:p,b:q,outside,directed_wave_side,owner:mesh.owner,
+                exterior_only:contour && !boundary && !crease && !mark && !material});
             if chained {
                 stamp_edges[job as usize].push([
                     if codes[a]&48==0 {a as u32} else {CUT_VERTEX},
@@ -711,17 +1083,31 @@ unsafe fn prepare(frame: &Frame, mesh: &Mesh) -> Option<Ink> {
     for &job in jobs {
         let i = job as usize;
         if !stamp_edges[i].is_empty() {
-            ink.stamp_spans[i] = stamp_spans(&ink.strokes[i], &stamp_edges[i], mesh.vertex_count);
+            let style = frame.styles[i];
+            let angle = if style.flags & WAVE_DIRECTION != 0 { Some(style.dash[2]) }
+                        else { None };
+            ink.stamp_spans[i] = stamp_spans(&ink.strokes[i], &stamp_edges[i], mesh.vertex_count, angle,
+                style.flags & WAVE_COUNTERCLOCKWISE != 0, (style.flags >> 11) & 7);
         }
     }
     Some(ink)
 }
 
 fn has_crease(first: Incident, second: Incident, extra_start: u32, extra: &[(u32,u32)],
-              normals: &[Vec3], style: Style) -> bool {
-    let check = |a: Incident,b: Incident| {
-        let cosine = dot(normals[a.face],normals[b.face]);
+              normals: &[Vec3], style: Style, selected: Option<&[u8]>) -> bool {
+    any_face_pair(first, second, extra_start, extra, selected, |a, b| {
+        let cosine = dot(normals[a], normals[b]);
         cosine >= style.min_cos && cosine <= style.max_cos
+    })
+}
+
+fn any_face_pair(first: Incident, second: Incident, extra_start: u32, extra: &[(u32,u32)],
+                 selected: Option<&[u8]>, predicate: impl Fn(usize, usize) -> bool) -> bool {
+    let check = |a: Incident,b: Incident| {
+        if selected.is_some_and(|mask| mask[a.face] == 0 && mask[b.face] == 0) {
+            return false;
+        }
+        predicate(a.face, b.face)
     };
     if check(first,second) { return true; }
     let mut index = extra_start;
@@ -741,7 +1127,7 @@ fn has_crease(first: Incident, second: Incident, extra_start: u32, extra: &[(u32
 }
 
 #[no_mangle]
-pub extern "C" fn rea_cpu_lines_abi_version() -> u32 { 3 }
+pub extern "C" fn rea_cpu_lines_abi_version() -> u32 { 7 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rea_cpu_lines_create(
@@ -772,7 +1158,8 @@ pub unsafe extern "C" fn rea_cpu_lines_create(
                 .map_or(1., |curve| curve.iter().copied().fold(1., f32::max));
             stroke_curves.push(profiles);
             resolved.push(Style {flags:style.flags,min_cos:style.min_cos,max_cos:style.max_cos,
-                                 radius:style.radius,aa:style.aa,rgba:style.rgba,max_stroke_size});
+                                 radius:style.radius,aa:style.aa,rgba:style.rgba,max_stroke_size,
+                                 wave:style.wave,dash:style.dash});
             stamps.push(stamp);
             reductions.push(std::array::from_fn(|index| {
                 let input = &style.reduction[index];
@@ -817,8 +1204,19 @@ pub unsafe extern "C" fn rea_cpu_lines_draw(
                 strokes += ink.len();
                 let points = &part.reduction_points[index];
                 let spans = &part.stamp_spans[index];
+                let style = frame.styles[index];
+                let hidden = style.flags & HIDDEN != 0;
+                let categories = style.flags & (OUTLINE | BORDER | CREASE | MATERIAL | MARK);
+                let wave_runs = if style.wave[0] != 0. && (categories == MARK || hidden && categories == CREASE) {
+                    let allow_shallow_turns = style.wave[0].abs() <= 2.*style.radius
+                        && frame.reductions[index][0].is_none();
+                    frame.chain_wave_runs(ink, spans, allow_shallow_turns, hidden)
+                } else {
+                    Vec::new()
+                };
                 for (i, &stroke) in ink.iter().enumerate() {
-                    frame.stroke(stroke,index,rect,pixels,spans.get(i),points.get(i));
+                    frame.stroke(stroke,index,rect,pixels,spans.get(i),points.get(i),
+                                 wave_runs.get(i).and_then(Option::as_deref));
                 }
             }
         }

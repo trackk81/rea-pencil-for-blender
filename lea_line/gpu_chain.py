@@ -221,8 +221,86 @@ vec4 directionResult(int e){
  float last=abs(readValue(directionHeads,e*2+1).y)/1024.0;
  return vec4(directionVote(forward.yz,atStart),directionVote(atEnd,reverse.yz),first,last);
 }
+bool hasWaveLoop(){
+ return readValue(styleData,7).x>.5&&readValue(styleData,18).x!=0.0&&
+        readValue(styleData,5).x<1.5;
+}
+int nextLoopHalf(int halfEdge){
+ vec2 links=readValue(jointData,halfEdge/2).xy;
+ return int(halfEdge%2==0?links.y:links.x);
+}
+vec2 loopPoint(int halfEdge){
+ vec4 p=viewProjection*vec4(edge(halfEdge/2,halfEdge%2).xyz,1);
+ return p.xy/p.w*viewportInfo.xy*.5;
+}
+vec2 loopStartKey(vec2 p,int policy){
+ if(policy==2)return vec2(-p.x,p.y);
+ if(policy==3)return p.yx;
+ if(policy==4)return vec2(-p.y,p.x);
+ return p;
+}
+void chooseWaveLoop(int id){
+ vec4 rank=readValue(metaInput,id);
+ if(rank.x<0.0)return;
+ vec2 ends=readValue(topologyData,id/2).xy;
+ int vertex=int(id%2==0?ends.x:ends.y);
+ if(vertex!=int(rank.w))return;
+ // The two half-edges leaving the canonical vertex describe the same loop.
+ int other=nextLoopHalf(id^1);
+ if(other<0||id>other)return;
+ vec2 origin=loopPoint(id),lo=origin,hi=origin;
+ float area=0.0;
+ int cursor=id;
+ int size=0;
+ do {
+  int next=nextLoopHalf(cursor);
+  if(next<0||size>=counts.x)return;
+  vec2 a=loopPoint(cursor),b=loopPoint(next);
+  lo=min(lo,a);hi=max(hi,a);
+  vec2 u=a-origin,v=b-origin;
+  area+=u.x*v.y-u.y*v.x;
+  cursor=next;size++;
+ }while(cursor!=id);
+ float angle=readValue(styleData,7).y;
+ // Pencil+ weights the image-space direction by the projected loop bounds.
+ vec2 axis=(hi-lo)*vec2(cos(angle),-sin(angle));
+ int controls=int(readValue(styleData,18).w);
+ int startPolicy=controls>>1;
+ vec2 lowest=vec2(1e30);
+ int selectedHalf=id;
+ for(int i=0;i<size;i++){
+  int next=nextLoopHalf(cursor);
+  vec2 a=loopPoint(cursor)-origin,b=loopPoint(next)-origin;
+  vec2 score=startPolicy==0?vec2(dot((a+b)*.5,axis),float(cursor/2)):
+             loopStartKey(a,startPolicy);
+  if(score.x<lowest.x||(score.x==lowest.x&&score.y<lowest.y)){
+   lowest=score;selectedHalf=cursor;
+  }
+  cursor=next;
+ }
+ bool counterclockwise=(controls&1)!=0;
+ bool reverse=(area>0.0)!=counterclockwise;
+ int side=(selectedHalf%2)^int(reverse&&startPolicy==0);
+ vec2 selectedEnds=readValue(topologyData,selectedHalf/2).xy;
+ float seam=side==0?selectedEnds.x:selectedEnds.y;
+ int width=imageSize(metaOutput).x;
+ for(int i=0;i<size;i++){
+  int e=cursor/2;
+  imageStore(metaOutput,ivec2(e%width,e/width),vec4(seam,float((cursor%2)^int(reverse)),1,0));
+  cursor=nextLoopHalf(cursor);
+ }
+}
 void main(){
  int id=int(gl_GlobalInvocationID.x),mode=counts.y;
+ if(mode==16){
+  if(id<counts.x*2)chooseWaveLoop(id);
+  return;
+ }
+ if(mode==15){
+  int width=imageSize(metaOutput).x;
+  if(id<counts.x)imageStore(metaOutput,ivec2(id%width,id/width),vec4(0));
+  return;
+ }
  if(mode==14){
   int width=imageSize(metaOutput).x,e=id/width;
   if(e<counts.x)imageStore(metaOutput,ivec2(id%width,e),waveMaskWord(e,id%width));
@@ -236,7 +314,8 @@ void main(){
   if(next>=0){vec4 tail=readValue(metaInput,next);value=vec4(tail.x,value.y+tail.y,tail.z,mode==2?min(value.w,tail.w):tail.w);}
  }else if(mode==3){
   vec4 prior=readValue(metaInput,id);
-  value=prior.x<0.0?prior:initial(id,true,prior.w);
+  vec4 loop=hasWaveLoop()?readValue(waveLoop,id/2):vec4(0);
+  value=prior.x<0.0?prior:initial(id,true,loop.z>.5?loop.x:prior.w);
  }else if(mode==9){
   // Keep the original selected links before list ranking changes them.
   value=vec4(readValue(metaInput,id*2+1).x,readValue(metaInput,id*2).x,0,0);
@@ -267,18 +346,29 @@ void main(){
   bool direct=reverse.z<forward.z||(reverse.z==forward.z&&reverse.w<forward.w);
   vec4 options=readValue(styleData,7);
   bool wave=readValue(styleData,18).x!=0.0;
-  if((options.x>.5||wave)&&reverse.z!=forward.z&&reverse.z>=0.0&&forward.z>=0.0){
+  bool open=reverse.z!=forward.z&&reverse.z>=0.0&&forward.z>=0.0;
+  bool directedWave=wave&&open&&(options.x>.5||(viewportInfo.w>.5&&readValue(styleData,6).z==0.0))&&
+      readValue(styleData,5).x<1.5;
+  if((options.x>.5||wave)&&open){
    vec4 a=viewProjection*vec4(readValue(vertexData,int(reverse.z)).xyz,1);
    vec4 b=viewProjection*vec4(readValue(vertexData,int(forward.z)).xyz,1);
    vec2 axis=vec2(cos(options.y),sin(options.y));
    vec2 start=a.xy/max(a.w,.00001)*viewportInfo.xy;
    vec2 end=b.xy/max(b.w,.00001)*viewportInfo.xy;
-   direct=wave ? (start.x==end.x ? start.y<end.y : start.x<end.x) : dot(start,axis)<dot(end,axis);
+   if(directedWave){
+    // Pencil+ stores the direction in image coordinates with Y down.
+    float angle=options.x>.5?options.y:-0.5235987756;
+    float projection=dot(end-start,vec2(cos(angle),-sin(angle)));
+    if(options.x>.5||abs(projection)>0.0001)direct=projection>0.0001;
+   }else direct=wave ? (start.x==end.x ? start.y<end.y : start.x<end.x) : dot(start,axis)<dot(end,axis);
   }
+  bool directedLoop=hasWaveLoop()&&readValue(waveLoop,id).z>.5;
+  if(directedLoop)direct=readValue(waveLoop,id).y<.5;
   float begin=direct?reverse.y-len:forward.y;
   // A half-edge stops at this endpoint if its tail has only its own length.
   float ends=(reverse.y<=len?1.0:0.0)+(forward.y<=len?2.0:0.0);
-  value=vec4(max(0.0,begin),max(0.0,begin+(direct?len:-len)),max(total,len),ends);
+  value=vec4(max(0.0,begin),max(0.0,begin+(direct?len:-len)),max(total,len),
+             ends+((directedWave||directedLoop)?4.0:0.0));
  }
  int w=imageSize(metaOutput).x;imageStore(metaOutput,ivec2(id%w,id/w),value);
 }
@@ -295,6 +385,7 @@ def resources():
     info.sampler(11,'FLOAT_2D','jointData')
     info.sampler(12,'FLOAT_2D','directionHeads')
     info.sampler(13,'FLOAT_2D','chainPrefix')
+    info.sampler(14,'FLOAT_2D','waveLoop')
     info.image(0,'RGBA32F','FLOAT_2D','metaOutput',qualifiers={'WRITE'})
     for kind,name in (('MAT4','viewProjection'),('VEC4','viewportInfo'),('VEC4','eyeInfo'),('VEC4','directionInfo'),('IVEC4','counts')):info.push_constant(kind,name)
     info.compute_source(SOURCE);_shader=gpu.shader.create_from_info(info);return _shader
@@ -319,6 +410,7 @@ def _bind(group,projection,viewport,eye,direction,depth):
     shader.uniform_sampler('jointData',group['joint_texture'])
     shader.uniform_sampler('directionHeads',group.get('direction_heads',group['normal_texture']))
     shader.uniform_sampler('chainPrefix',group['normal_texture'])
+    shader.uniform_sampler('waveLoop',group['normal_texture'])
     return shader
 
 
@@ -346,7 +438,8 @@ def update(group,projection,viewport,eye,direction,area_id=0):
         view={'texture':gpu.types.GPUTexture(group['chain_result_size'],format='RGBA32F'),'signature':None};group['chain_views'][area_id]=view
     group['chain_texture']=view['texture']
     params=group['style']['params']
-    track_joints = tracks_joints(params)
+    directed_loops = bool(params[7,0] and params[18,0] and params[5,0] < 1.5)
+    track_joints = tracks_joints(params) or directed_loops
     if track_joints and 'joints' not in view:
         view['joints']=gpu.types.GPUTexture(group['chain_result_size'],format='RGBA32F')
     group['joint_texture']=view.get('joints',view['texture'])
@@ -357,6 +450,13 @@ def update(group,projection,viewport,eye,direction,area_id=0):
     dispatch(1,group['texture'],ping[0],2*n)
     if track_joints:dispatch(9,ping[0],view['joints'],n)
     for _ in range(steps):dispatch(2,ping[current],ping[1-current],2*n);current=1-current
+    if directed_loops:
+        if 'wave_loop' not in view:
+            view['wave_loop']=gpu.types.GPUTexture(group['chain_result_size'],format='RGBA32F')
+        loop=view['wave_loop']
+        dispatch(15,ping[current],loop,n)
+        dispatch(16,ping[current],loop,2*n)
+        shader.uniform_sampler('waveLoop',loop)
     dispatch(3,ping[current],ping[1-current],2*n);current=1-current
     for _ in range(steps):dispatch(4,ping[current],ping[1-current],2*n);current=1-current
     dispatch(5,ping[current],group['chain_texture'],n)

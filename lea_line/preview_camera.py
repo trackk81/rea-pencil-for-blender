@@ -10,6 +10,42 @@ from . import free_view
 TAG = 'rea_preview_camera_width'
 PREFIX = '.rea camera '
 
+def camera_view_pixel_size(scene):
+    """World size of one viewport pixel, at unit depth for perspective."""
+    if bpy.app.background or free_view.dimensions(scene) or not scene.camera:
+        return None
+    windows = bpy.context.window_manager.windows if bpy.context.window_manager else ()
+    candidates = []
+    for window in windows:
+        if window.scene != scene or not window.screen:
+            continue
+        for area in window.screen.areas:
+            if area.type != 'VIEW_3D':
+                continue
+            space = area.spaces.active
+            view = space.region_3d
+            if view is None or view.view_perspective != 'CAMERA' or (space.camera or scene.camera) != scene.camera:
+                continue
+            region = next((r for r in area.regions if r.type == 'WINDOW' and r.height > 0), None)
+            if region:
+                scale = abs(view.window_matrix[1][1]) * region.height
+                if scale > 1e-6:
+                    candidates.append((region.width * region.height, 2. / scale))
+    return max(candidates)[1] if candidates else None
+
+
+def simple_coverage_width(scene, line_set, width):
+    from .width_profile import live_coverage_width
+    output = getattr(line_set, 'line_output', None)
+    mode = output.width_mode if output else 'INHERIT'
+    if mode == 'INHERIT':
+        mode = scene.lea_line.width_mode
+    if mode == 'ABSOLUTE':
+        pixel = camera_view_pixel_size(scene)
+        if pixel is not None:
+            return live_coverage_width(width * free_view.pixel_scale()) * pixel / projection(scene)[2]
+    return live_coverage_width(width)
+
 def stroke_width(scene, line_set, thickness):
     """Apply the active preview's width units to an authored brush size."""
     from . import backend
@@ -46,7 +82,9 @@ def signature(scene):
     camera, perspective, factor, clip = projection(scene)
     return (camera.as_pointer(), perspective, factor, clip,
             scene.render.pixel_aspect_x / scene.render.pixel_aspect_y,
-            scene.render.resolution_y, scene.render.resolution_percentage)
+            scene.render.resolution_y, scene.render.resolution_percentage,
+            (camera_view_pixel_size(scene), free_view.pixel_scale())
+            if scene.lea_line.preview_compute == 'NATIVE' and scene.lea_line.preview_simple_coverage else None)
 
 
 def _node(graph, kind, name):

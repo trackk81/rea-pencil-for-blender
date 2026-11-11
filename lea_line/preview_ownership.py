@@ -7,6 +7,7 @@ from Blender's main thread; never replace authored edge marks with this result.
 """
 import math
 import numpy as np
+from .blender_compat import read_mesh_marks
 
 MATERIAL, MARKED, CREASE = 1, 2, 3
 
@@ -39,8 +40,7 @@ def edge_owners(mesh, matrix_world, crease_threshold, active=('material_boundary
         raise ValueError('Crease threshold must be finite and within0..pi')
     threshold=min(math.pi,threshold)  # Blender RNA stores pi rounded to float32.
     owners=np.zeros(count,dtype=np.uint8)
-    marks=np.empty(count,dtype=np.bool_)
-    mesh.edges.foreach_get('use_freestyle_mark',marks)
+    marks=read_mesh_marks(mesh,'EDGE')
     loops=np.empty(len(mesh.loops),dtype=np.int32)
     if not _read_int_attribute(mesh,'.corner_edge','CORNER',loops):
         mesh.loops.foreach_get('edge_index',loops)

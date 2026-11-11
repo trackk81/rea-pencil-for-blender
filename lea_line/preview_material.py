@@ -7,10 +7,10 @@ the last valid output. All Blender work runs on the main thread.
 """
 import uuid
 import bpy
-from .blender_compat import grease_pencil_data
+from .blender_compat import grease_pencil_data, lineart_width_property, write_mesh_marks
 import numpy as np
 from bpy.app.handlers import persistent
-from . import material_scope, native_core
+from . import free_view, material_scope, native_core
 
 TAG = 'rea_private_material'
 OWNER = 'rea_private_material_owner'
@@ -31,8 +31,8 @@ _paused_geometry = set()
 LINE_PROPERTIES = ('target_layer', 'target_material', 'use_contour', 'use_crease',
     'crease_threshold', 'use_crease_on_smooth', 'use_crease_on_sharp', 'use_material',
     'use_edge_mark', 'use_intersection', 'use_loose', 'use_shadow', 'use_light_contour',
-    'use_multiple_levels', 'level_start', 'level_end', 'opacity', 'thickness', 'use_cache',
-    'stroke_depth_offset')
+    'use_multiple_levels', 'level_start', 'level_end', 'opacity', 'use_cache',
+    'stroke_depth_offset', 'overscan')
 CAMERA_PROPERTIES = ('type', 'lens', 'ortho_scale', 'sensor_fit', 'sensor_width',
     'sensor_height', 'shift_x', 'shift_y', 'clip_start', 'clip_end')
 RENDER_PROPERTIES = ('resolution_x', 'resolution_y', 'resolution_percentage', 'pixel_aspect_x', 'pixel_aspect_y')
@@ -95,8 +95,9 @@ def is_suspended():
 
 def unsupported_reason(scene, node=None):
     """Bounded viewport-only support; reject unproven visibility/instance paths."""
-    if not scene.camera or scene.camera.data.type not in {'ORTHO', 'PERSP'}:
-        return 'Material live preview needs a perspective or orthographic scene camera.'
+    camera = free_view.camera(scene)
+    if not camera or camera.data.type not in {'ORTHO', 'PERSP'}:
+        return 'Material live preview needs a perspective or orthographic view.'
     if len(scene.view_layers) != 1:
         return 'Material live preview currently supports one view layer.'
     if scene.render.use_simplify:
@@ -227,9 +228,9 @@ def _matrix(value):
 
 def _signature(scene, node, preview):
     modifier = next(m for m in preview.modifiers if m.type == 'LINEART')
-    camera = scene.camera
+    camera = free_view.camera(scene)
     values = tuple((_pointer(getattr(modifier, name)) if name == 'target_material' else getattr(modifier, name))
-                   for name in LINE_PROPERTIES)
+                   for name in (*LINE_PROPERTIES, lineart_width_property(modifier)))
     objects = tuple((_pointer(o), _pointer(o.data), _matrix(o.matrix_world), o.lineart.usage,
                      tuple(_pointer(s.material) for s in o.material_slots))
                     for o in scene.objects if o.type == 'MESH' and not o.get('rea_pencil_preview'))
@@ -239,7 +240,8 @@ def _signature(scene, node, preview):
                tuple(sorted(_pointer(o) for o in node.source_collection.all_objects)) if node.source_collection else ())
     return (scene.frame_current, _pointer(camera), _matrix(camera.matrix_world),
             tuple(getattr(camera.data, name) for name in CAMERA_PROPERTIES),
-            tuple(getattr(scene.render, name) for name in RENDER_PROPERTIES), values, objects, targets)
+            tuple(getattr(scene.render, name) for name in RENDER_PROPERTIES),
+            free_view.dimensions(scene), values, objects, targets)
 
 
 class _Entry:
@@ -266,7 +268,7 @@ class _Entry:
         source = self.source
         self.scene = _tag(bpy.data.scenes.new('.rea private material evaluation'), self.token, self.source_token)
         self.scene.render.engine = source.render.engine
-        camera_data = _tag(source.camera.data.copy(), self.token, self.source_token)
+        camera_data = _tag(free_view.camera(source).data.copy(), self.token, self.source_token)
         # This is an evaluated static camera proxy, not a second animation rig.
         # A copied driver must never re-evaluate against the private scene.
         camera_data.animation_data_clear()
@@ -344,12 +346,18 @@ class _Entry:
             keys = {_pointer(o) for o in self.source.objects if o.type == 'MESH' and not o.get('rea_pencil_preview')}
             if fresh or geometry_dirty or keys != set(self.proxies):
                 self._refresh_meshes(depsgraph)
-            source_camera = self.source.camera.evaluated_get(depsgraph)
+            source_camera = free_view.camera(self.source).evaluated_get(depsgraph)
             self.camera.matrix_world = source_camera.matrix_world
             for name in CAMERA_PROPERTIES:
                 setattr(self.camera.data, name, getattr(source_camera.data, name))
             for name in RENDER_PROPERTIES:
                 setattr(self.scene.render, name, getattr(self.source.render, name))
+            dimensions = free_view.dimensions(self.source)
+            if dimensions:
+                render = self.scene.render
+                render.resolution_x, render.resolution_y = dimensions
+                render.resolution_percentage = 100
+                render.pixel_aspect_x = render.pixel_aspect_y = 1.
             # frame_set evaluates immediately even when the frame is unchanged.
             # The final private layer update below still evaluates all proxies.
             if self.scene.frame_current != self.source.frame_current or self.scene.frame_subframe != 0:
@@ -377,7 +385,7 @@ class _Entry:
                 allowed = scope is None or source in scope
                 mask = self.face_mask(node,source,proxy,allowed,explicit,materials)
                 if item['mask'] is None or not np.array_equal(item['mask'], mask):
-                    proxy.data.polygons.foreach_set('use_freestyle_mark', mask)
+                    write_mesh_marks(proxy.data,'FACE',mask)
                     proxy.data.update()
                     item['mask'] = mask.copy()
             _count(self.source, 'transform_updates')
@@ -387,7 +395,7 @@ class _Entry:
         # The private graph evaluates geometry, so layer alpha is not baked
         # into the points and must travel with the copied layer.
         self.ink.data.layers[0].opacity = preview.data.layers[0].opacity
-        for name in LINE_PROPERTIES:
+        for name in (*LINE_PROPERTIES, lineart_width_property(source_modifier)):
             setattr(modifier, name, getattr(source_modifier, name))
         modifier.target_layer = self.ink.data.layers[0].name
         modifier.source_type, modifier.source_collection = 'SCENE', None

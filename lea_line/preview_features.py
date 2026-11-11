@@ -5,9 +5,10 @@ output/camera graph IDs are reused; unchanged updates perform no Blender writes.
 """
 import json
 import bpy
+from .blender_compat import lineart_width_property, lineart_width_value, write_mesh_marks
 import numpy as np
 from . import routing,backend,preview_material as private,preview_camera,preview_ownership,preview_batch
-from .width_profile import live_coverage_width,live_coverage_supported
+from .width_profile import live_coverage_supported
 
 FEATURES=(('material_boundary',1),('edge_mark',2),('crease',3))
 _cache={}
@@ -87,7 +88,7 @@ class _FeatureEntry(private._Entry):
                     self.owners_cache[key]=owners
                 mask=owners==self.code
             else:mask=np.zeros(len(proxy.data.edges),dtype=np.bool_)
-            proxy.data.edges.foreach_set('use_freestyle_mark',mask);proxy.data.update()
+            write_mesh_marks(proxy.data,'EDGE',mask);proxy.data.update()
 
     def face_mask(self,node,source,proxy,allowed,explicit,materials):
         return np.full(len(proxy.data.polygons),self.targeted(source),dtype=np.bool_)
@@ -145,16 +146,18 @@ def _sync(scene,node,common,index):
             material=output.data.materials[0]
             if material.grease_pencil is None:bpy.data.materials.create_gpencil_data(material)
             modifier=next(m for m in output.modifiers if m.type=='LINEART')
-            metadata.append((modifier,modifier.opacity,modifier.thickness))
+            width_property = lineart_width_property(modifier)
+            metadata.append((modifier,modifier.opacity,width_property,getattr(modifier,width_property)))
             modifier.target_layer=output.data.layers[0].name;modifier.target_material=material
             for flag in ('use_contour','use_crease','use_material','use_intersection','use_loose','use_shadow','use_light_contour'):
                 setattr(modifier,flag,False)
             modifier.use_edge_mark=True;modifier.opacity=brush.alpha
             width=brush.thickness*backend.width_scale(scene, node)
-            if scene.lea_line.preview_simple_coverage and live_coverage_supported(brush):width=live_coverage_width(width)
-            modifier.thickness=max(1,min(200,round(width)));modifier.use_multiple_levels=False
+            if scene.lea_line.preview_simple_coverage and live_coverage_supported(brush):
+                width = preview_camera.simple_coverage_width(scene, node, width)
+            setattr(modifier,width_property,lineart_width_value(width_property,width));modifier.use_multiple_levels=False
             modifier.level_start=modifier.level_end=0;modifier.show_viewport=modifier.show_render=False
-            if existed is None:preview_camera.sync(output,scene,width,viewport._set)
+            preview_camera.sync(output,scene,width,viewport._set)
             entry=_FeatureEntry(scene,output,node,code,active,owners_cache=owners_cache)
             snapshot=None
             try:
@@ -186,8 +189,8 @@ def _sync(scene,node,common,index):
     except Exception as error:
         for _,snapshot in pairs:
             if private._valid(snapshot):private._remove_output(snapshot)
-        for modifier,opacity,thickness in metadata:
-            try:modifier.opacity=opacity;modifier.thickness=thickness
+        for modifier,opacity,width_property,thickness in metadata:
+            try:modifier.opacity=opacity;setattr(modifier,width_property,thickness)
             except ReferenceError:pass
         for output in created:viewport._remove_object(scene,output)
         result.update(handled=bool(old),keys=[o.get(viewport.KEY) for o in old],

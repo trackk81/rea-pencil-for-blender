@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 import bpy
 import numpy as np
+from .blender_compat import read_mesh_marks
 from . import backend, ui
 
 _entry = None
@@ -267,13 +268,15 @@ def fingerprint(scene):
                     (mesh.edges, 'vertices', 2, np.int32),
                     (mesh.loops, 'vertex_index', 1, np.int32), (mesh.loops, 'edge_index', 1, np.int32),
                     (mesh.polygons, 'loop_start', 1, np.int32), (mesh.polygons, 'loop_total', 1, np.int32),
-                    (mesh.polygons, 'material_index', 1, np.int32), (mesh.polygons, 'use_smooth', 1, np.bool_),
-                    (mesh.polygons, 'use_freestyle_mark', 1, np.bool_),
-                    (mesh.edges, 'use_freestyle_mark', 1, np.bool_)):
+                    (mesh.polygons, 'material_index', 1, np.int32), (mesh.polygons, 'use_smooth', 1, np.bool_)):
                 data = np.empty(len(elements) * count, dtype=dtype)
                 elements.foreach_get(attr, data)
                 add([attr, len(elements), count, np.dtype(dtype).str])
                 digest.update(data.tobytes())
+            for domain in ('FACE', 'EDGE'):
+                marks = read_mesh_marks(mesh, domain)
+                add(['freestyle_mark', domain, len(marks)])
+                digest.update(marks.tobytes())
             add(mesh.has_custom_normals)
             add([(slot.material.name_full, slot.material.as_pointer()) if slot.material else None for slot in obj.material_slots])
             if mesh.has_custom_normals:
