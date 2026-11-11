@@ -282,7 +282,7 @@ class LEAOutputNode(_LEANode, bpy.types.Node):
         description='GPU approximation of the measured Pencil+ edge resolve. 1 preserves existing REA output')
     width_mode: EnumProperty(name='Line Size', items=[('INHERIT', 'Scene Default', 'Preserve legacy scene width settings'),
         ('ABSOLUTE', 'Absolute', 'Fixed pixel widths for this Line'),
-        ('RELATIVE', 'Relative (640*480)', 'Scale this Line with render height / 480')],
+        ('RELATIVE', 'Relative (640*480)', '일반 자유 시점에서는 뷰포트 크기에 맞추고, 카메라 기준과 최종 렌더에서는 렌더 높이로 환산합니다')],
         default='INHERIT', update=_sync_if_enabled)
     line_size_type: EnumProperty(name='Line Size', items=[('ABSOLUTE', 'Absolute', '', 0),
         ('RELATIVE', 'Relative (640*480)', '', 1)],

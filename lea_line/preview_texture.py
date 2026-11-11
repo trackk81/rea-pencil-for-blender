@@ -152,9 +152,8 @@ def sync(obj,brush,scene,line_set=None):
     from . import stamp_brush
     stamps=stamp_brush.spec(brush)
     if not chosen and variation is None and stamps is None and not getattr(brush,'hidden_mask_objects',()):cleanup(obj);return
-    from . import backend
     stamp_map = stamp_brush.detail_map(brush, 'brush') if stamps else None
-    pattern = stamp_brush.preview_pattern(stamp_map, brush.thickness * backend.width_scale(scene, line_set)) if stamp_map else (1., 0.)
+    pattern = stamp_brush.preview_pattern(stamp_map, preview_camera.stroke_width(scene, line_set, brush.thickness)) if stamp_map else (1., 0.)
     camera, _, _, _ = preview_camera.projection(scene)
     frame=camera.data.view_frame(scene=scene)
     from . import object_uv

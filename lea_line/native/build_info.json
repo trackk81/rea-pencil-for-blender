@@ -4,12 +4,12 @@
   "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
   "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "crt_linkage": "static",
-  "dll_sha256": "cc32e1e5a7fd2258d6966ff6febe7b1a3e4de840673514b7f22451532a761ab0",
+  "dll_sha256": "04a6998a78553eeed3dd28ddd2045d8f656699e0674bb6b213cf07a445e85d70",
   "rust_source_sha256": "35e71cc3221684228437a45179499f2a4d53c20b0cdf68e54e90e11d5b49b337",
   "rust_source_files_sha256": {
     "src/lib.rs": "35e71cc3221684228437a45179499f2a4d53c20b0cdf68e54e90e11d5b49b337",
     "src/ownership.rs": "7b2592396efd152d53c35b7a7ee33bf9d2c0f679cd80c3d434a1c240e531112b",
-    "src/cpu_lines.rs": "17db264a13bf6675e0e87b978726383f5cf1a693eaf795e4e4804b11e9f36cff",
+    "src/cpu_lines.rs": "23fd7e846a09c84cba33fbb55b108e1a29ecd9993776110ff4beb01928c0f73a",
     "include/rea_pencil_core.h": "a72acddbde4359a3c04fb88680063bb539e41704993ba4b034814398c1b84f71"
   },
   "cpu_lines_abi_version": 2,

@@ -10,6 +10,21 @@ from . import free_view
 TAG = 'rea_preview_camera_width'
 PREFIX = '.rea camera '
 
+def stroke_width(scene, line_set, thickness):
+    """Apply the active preview's width units to an authored brush size."""
+    from . import backend
+    dimensions = free_view.dimensions(scene)
+    output = getattr(line_set, 'line_output', None)
+    mode = output.width_mode if output else 'INHERIT'
+    if dimensions and mode == 'RELATIVE':
+        # The Pencil+ 640×480 reference covers the viewport. Wide views
+        # use the width ratio, tall views the height ratio.
+        return thickness * max(dimensions[0] / 640., dimensions[1] / 480.)
+    width = thickness * backend.width_scale(scene, line_set)
+    if dimensions and (mode == 'ABSOLUTE' or mode == 'INHERIT' and scene.lea_line.width_mode == 'ABSOLUTE'):
+        width *= free_view.pixel_scale()
+    return width
+
 
 def projection(scene):
     camera = free_view.camera(scene)

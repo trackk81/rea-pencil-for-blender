@@ -69,6 +69,7 @@ struct Stroke {
     b: Vec3,
     outside: f32,
     owner: u32,
+    exterior_only: bool,
 }
 
 pub struct Ink {
@@ -164,6 +165,52 @@ fn stamp_spans(lines: &[Stroke], endpoints: &[[u32; 2]], vertex_count: usize) ->
         if first != NONE { walk(first); }
     }
     spans
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    fn line(a: [f32; 2], b: [f32; 2]) -> Stroke {
+        Stroke { a:[a[0],a[1],0.5], b:[b[0],b[1],0.5], outside:1.0,
+                 owner:1, exterior_only:true }
+    }
+
+    #[test]
+    fn reversed_edges_preserve_continuous_distance_from_terminal() {
+        let lines = [line([3.,4.],[3.,0.]), line([0.,0.],[3.,0.])];
+        let spans = stamp_spans(&lines, &[[2,1],[0,1]], 3);
+        assert_eq!((spans[1].start,spans[1].end), (0.,3.));
+        assert_eq!((spans[0].start,spans[0].end), (7.,3.));
+        assert_eq!(spans[1].caps,[true,false]);
+        assert_eq!(spans[0].caps,[true,false]);
+    }
+
+    #[test]
+    fn closed_loop_accumulates_exactly_one_perimeter_without_caps() {
+        let lines = [line([0.,0.],[3.,0.]),line([3.,0.],[3.,4.]),
+                     line([3.,4.],[0.,4.]),line([0.,4.],[0.,0.])];
+        let spans = stamp_spans(&lines,&[[0,1],[1,2],[2,3],[3,0]],4);
+        let mut previous = 0.;
+        for span in spans {
+            assert_eq!(span.start,previous);
+            assert_eq!(span.caps,[false,false]);
+            previous=span.end;
+        }
+        assert_eq!(previous,14.);
+    }
+
+    #[test]
+    fn branches_and_clipped_endpoints_do_not_join_unrelated_runs() {
+        let lines = [line([0.,0.],[1.,0.]),line([0.,0.],[0.,2.]),
+                     line([0.,0.],[-3.,0.]),line([4.,0.],[6.,0.])];
+        let spans = stamp_spans(&lines,&[[0,1],[0,2],[0,3],[CUT_VERTEX,CUT_VERTEX]],4);
+        for (span,length) in spans.iter().zip([1.,2.,3.,2.]) {
+            assert_eq!(span.start.min(span.end),0.);
+            assert_eq!((span.end-span.start).abs(),length);
+            assert_eq!(span.caps,[true,true]);
+        }
+    }
 }
 
 const OUTLINE: u32 = 1;
@@ -288,6 +335,10 @@ impl Frame {
     }
 
     fn visible(&self, center: Vec3, outward: [f32; 2], owner: u32) -> bool {
+        center[2] <= self.visibility_limit(center, outward, owner)
+    }
+
+    fn visibility_limit(&self, center: Vec3, outward: [f32; 2], owner: u32) -> f32 {
         let [x,y,z] = center;
         let ix = (x-0.5).floor() as i32;
         let iy = (y-0.5).floor() as i32;
@@ -309,7 +360,7 @@ impl Frame {
         };
         let low = tap(ix,iy)*(1.0-fx)+tap(ix+1,iy)*fx;
         let high = tap(ix,iy+1)*(1.0-fx)+tap(ix+1,iy+1)*fx;
-        z <= low*(1.0-fy)+high*fy+DEPTH_BIAS
+        low*(1.0-fy)+high*fy+DEPTH_BIAS
     }
 
     fn stroke(&self, line: Stroke, style: Style, rect: [usize; 4], output: &mut [[f32; 4]],
@@ -346,6 +397,17 @@ impl Frame {
                 if distance_sq >= reach*reach { continue; }
                 let center = [a[0]+t*d[0],a[1]+t*d[1],a[2]+t*d[2]];
                 if !self.visible(center,outward,line.owner) { continue; }
+                // An Outline is an exterior contour, not every front/back
+                // transition inside the same mesh (for example a dish rim).
+                // Keep independent open borders and crease/marked strokes.
+                if line.exterior_only {
+                    let (backing, owner) = self.sample(
+                        (center[0]+1.5*outward[0]).floor() as i32,
+                        (center[1]+1.5*outward[1]).floor() as i32);
+                    if interior_backing(line.owner, backing, owner) {
+                        continue;
+                    }
+                }
                 let coverage = if aa == 0.0 { 1.0 }
                     else { (0.5+(style.radius-distance_sq.sqrt())/aa).clamp(0.0,1.0) };
                 let (x,y) = if axis == 0 {(i,j)} else {(j,i)};
@@ -364,6 +426,45 @@ impl Frame {
                 pixel[3] = alpha + pixel[3]*(1.0-alpha);
             }
         }
+    }
+}
+
+fn interior_backing(owner: u32, backing: f32, backing_owner: u32) -> bool {
+    // Outline describes the object's projected exterior. A same-object hit
+    // on its outward side remains interior even at a shallow/tangent fold.
+    backing_owner == owner && backing < 1.0
+}
+
+#[cfg(test)]
+mod outline_tests {
+    use super::*;
+
+    #[test]
+    fn owner_corrected_depth_is_cubic_even_inside_one_cell() {
+        let depth = (0..16).map(|i| {
+            let owner=if i==0 {1u32} else {2u32};
+            AtomicU64::new(((0.7f32.to_bits() as u64)<<32)|owner as u64)
+        }).collect();
+        let frame=Frame {width:4,height:4,styles:vec![],stamps:vec![],depth};
+        let samples=|outward| {
+            [0.,1./3.,2./3.,1.].map(|t| {
+                let point=[0.6+0.3*t,0.6+0.3*t,0.4+0.2*t];
+                frame.visibility_limit(point,outward,1)-point[2]
+            })
+        };
+        let third=|f:[f32;4]| f[3]-3.*f[2]+3.*f[1]-f[0];
+        assert!(third(samples([0.,0.])).abs()<1e-6);
+        // One inward tap follows line z(t), multiplying its quadratic weight.
+        assert!(third(samples([1.,0.])).abs()>0.001);
+    }
+
+    #[test]
+    fn same_mesh_backing_rejects_interior_at_shallow_folds() {
+        assert!(interior_backing(7, 0.6, 7));
+        assert!(!interior_backing(7, 0.6, 8));
+        assert!(interior_backing(7, 0.5, 7));
+        assert!(interior_backing(7, 0.4, 7));
+        assert!(!interior_backing(7, 1.0, 0));
     }
 }
 
@@ -501,7 +602,8 @@ unsafe fn prepare(frame: &Frame, mesh: &Mesh) -> Option<Ink> {
                 q = screen(right,size);
             }
             if textured && (p[0]-q[0]).hypot(p[1]-q[1]) < 1e-5 { continue; }
-            ink.strokes[job as usize].push(Stroke {a:p,b:q,outside,owner:mesh.owner});
+            ink.strokes[job as usize].push(Stroke {a:p,b:q,outside,owner:mesh.owner,
+                exterior_only:contour && !boundary && !crease && !mark});
             if textured {
                 stamp_edges[job as usize].push([
                     if codes[a]&48==0 {a as u32} else {CUT_VERTEX},

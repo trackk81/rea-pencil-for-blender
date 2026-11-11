@@ -169,6 +169,16 @@ vec4 visibilityHead(int halfEdge,float minimum,bool marked,bool wave){
 }
 vec4 visibilityResult(int edgeId){
  vec4 forward=readValue(metaInput,edgeId*2),reverse=readValue(metaInput,edgeId*2+1);
+ // An unbroken visible cycle never reaches a terminal half-edge. Pointer
+ // doubling otherwise sums many laps, giving every segment a different
+ // wave origin. Reuse the selected chain's single-lap seam and distances.
+ if(readValue(styleData,18).x!=0.0 && forward.x>=0.0 && reverse.x>=0.0){
+  vec4 chain=readValue(chainPrefix,edgeId);
+  bool direct=chain.x<chain.y;
+  float before=direct?chain.x:chain.z-chain.x;
+  float after=direct?chain.z-chain.y:chain.y;
+  return vec4(max(0.0,before),max(0.0,after),forward.z,reverse.z);
+ }
  // Adjacent lengths can only be reached from the matching end of this edge.
  float before=reverse.w>=0.0?readValue(metaInput,int(reverse.w)).y:0.0;
  float after=forward.w>=0.0?readValue(metaInput,int(forward.w)).y:0.0;
@@ -284,6 +294,7 @@ def resources():
     # Preserve the draw shader's scene and object depth slots across compute.
     info.sampler(11,'FLOAT_2D','jointData')
     info.sampler(12,'FLOAT_2D','directionHeads')
+    info.sampler(13,'FLOAT_2D','chainPrefix')
     info.image(0,'RGBA32F','FLOAT_2D','metaOutput',qualifiers={'WRITE'})
     for kind,name in (('MAT4','viewProjection'),('VEC4','viewportInfo'),('VEC4','eyeInfo'),('VEC4','directionInfo'),('IVEC4','counts')):info.push_constant(kind,name)
     info.compute_source(SOURCE);_shader=gpu.shader.create_from_info(info);return _shader
@@ -307,6 +318,7 @@ def _bind(group,projection,viewport,eye,direction,depth):
     shader.uniform_sampler('sceneDepth',depth)
     shader.uniform_sampler('jointData',group['joint_texture'])
     shader.uniform_sampler('directionHeads',group.get('direction_heads',group['normal_texture']))
+    shader.uniform_sampler('chainPrefix',group['normal_texture'])
     return shader
 
 
@@ -373,6 +385,7 @@ def update_visibility(group,projection,viewport,eye,direction,depth,area_id,orig
     dispatch(6,group['texture'],ping[0],2*n)
     for _ in range(max(1,math.ceil(math.log2(max(2,2*n))))):
         dispatch(7,ping[current],ping[1-current],2*n);current=1-current
+    shader.uniform_sampler('chainPrefix',group['chain_texture'])
     dispatch(8,ping[current],view['visibility'],n)
     width,height=int(viewport[0]),int(viewport[1])
     mask = None

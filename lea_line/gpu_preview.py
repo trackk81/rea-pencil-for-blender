@@ -375,7 +375,7 @@ def _whole_mesh_material_target(mesh, obj, materials):
     return True
 
 
-def snapshot(scene, dg):
+def snapshot(scene, dg, *, preview_pixel_scale=1.0):
     """Copy evaluated geometry without installing viewport handlers or timers.
 
     A render engine passes its RENDER depsgraph; viewport sync passes VIEWPORT.
@@ -404,6 +404,10 @@ def snapshot(scene, dg):
         pieces = []; extra_pieces=[];extra_offset=0
         map_pieces=[];chain_vertices=[];chain_ends=[];vertex_offset=0
         scale = backend.width_scale(scene, node)
+        output = getattr(node, 'line_output', None)
+        width_mode = output.width_mode if output and output.width_mode != 'INHERIT' else scene.lea_line.width_mode
+        if not render and width_mode == 'ABSOLUTE':
+            scale *= preview_pixel_scale
         width = brush.thickness * scale
         object_mode = getattr(node, '_gpu_object_mode', 0)
         merge_mode = node._gpu_merge_mode
@@ -593,7 +597,9 @@ def sync(scene):
         window=next((w for w in bpy.context.window_manager.windows if w.scene==scene),None)
         if window is None:raise ValueError('GPU 미리보기 장면을 Blender 창에서 여세요')
         with bpy.context.temp_override(window=window):dg = bpy.context.evaluated_depsgraph_get()
-        entry = snapshot(scene, dg)
+        preferences = bpy.context.preferences
+        pixel_scale = preferences.system.ui_scale / max(preferences.view.ui_scale, 1e-6)
+        entry = snapshot(scene, dg, preview_pixel_scale=pixel_scale)
         entry['buffer_cache'] = gpu_preview_cache.BufferCache()
         _states[scene.as_pointer()] = entry
         if _handle is None:_handle = bpy.types.SpaceView3D.draw_handler_add(_draw, (), 'WINDOW', 'POST_VIEW')
@@ -1004,6 +1010,10 @@ float waveDistance(float reach,vec3 wave,vec2 run) {
     // the joint. Ignore subpixel continuation within the depth search's
     // one-pixel/1024 precision so a cut at the joint keeps its round cap.
     bool forward=chainSpan.x<chainSpan.y;
+    // An occlusion-open Outline follows the outward-normal winding, not
+    // mesh index order. Keep closed loops on their existing seam contract.
+    if (styleValue(6).z == -1.0 && run.y-run.x < chainSpan.z-1.0)
+        forward=waveSide>0.0;
     float origin=forward?run.x:run.y, direction=forward?1.0:-1.0;
     if (waveCorners.x>.5) run.x=max(0.0,run.x);
     if (waveCorners.y>.5) run.y=min(segmentLength,run.y);
@@ -1134,6 +1144,17 @@ void main() {
         } else if (directionInfo.w>.5 && segmentLength>1e-5) {
             if (!spanMeetsMinimum(points,segmentDepths(),t*segmentLength,wantHidden)) discard;
         }
+    }
+    // Wave visibility uses its own cut/cap search, but still needs the
+    // same source-edge Outline classification as an undistorted stroke.
+    if (modes.x>.5) {
+        vec4 points=screenEnds;
+        if (viewExtra.z>0.0) points-=viewExtra.xyxy;
+        vec2 center=mix(points.xy,points.zw,t);
+        vec4 clip=viewProjection*vec4(mix(worldA,worldB,u),1);
+        float depth=clip.z/clip.w*.5+.5;
+        vec2 objectOptions=styleValue(6).zw;
+        float objectMode=objectOptions.x;
         if (abs(objectMode)==1.0) {
             ivec2 pixel=ivec2(floor(center+objectOutside*1.5));
             ivec2 extent=textureSize(objectDepth,0);
@@ -1142,7 +1163,9 @@ void main() {
                 float backing=texelFetch(objectDepth,pixel,0).r;
                 float incidentDepth=depth+dot(vec2(pixel)+.5-center,objectDepthGradient);
                 bool coplanar=objectOptions.y>.5 && abs(backing-incidentDepth)<=.000002;
-                interior=backing<1.0 && (backing>depth+.000002 || coplanar);
+                // Exterior Outline must reject shallow same-object folds too.
+                // Object-edge selection retains its separate depth rule.
+                interior=backing<1.0 && (objectMode<0.0 || backing>depth+.000002 || coplanar);
             }
             if (interior!=(objectMode>0.0)) discard;
         }

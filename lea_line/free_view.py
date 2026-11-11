@@ -175,6 +175,18 @@ def update(scene,area,region):
     cam.data.lens=max(1.,min(5000.,18*projection[1][1]))
     cam.data.ortho_scale=2/max(1e-10,projection[1][1])
     cam.data.clip_start=space.clip_start;cam.data.clip_end=space.clip_end
+    if cam.data.type=='ORTHO' and projection[2][2]<-1e-12:
+        # Orthographic viewport depth can start behind the view origin.
+        # A camera requires a positive near plane: move only the helper back,
+        # preserving the viewport's XY projection and complete depth interval.
+        depth_scale=projection[2][2];depth_offset=projection[2][3]
+        near=(depth_offset+1.)/depth_scale
+        far=(depth_offset-1.)/depth_scale
+        shift=max(0.,space.clip_start-near)
+        matrix.translation+=matrix.col[2].to_3d()*shift
+        cam.matrix_world=matrix
+        cam.data.clip_start=near+shift
+        cam.data.clip_end=far+shift
     entry['dimensions']=(max(1,region.width),max(1,region.height));entry['signature']=flat
     return True
 

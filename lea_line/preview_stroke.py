@@ -381,7 +381,7 @@ def _size_data(brush):
     return _flat()
 
 
-def sync(obj, brush, scene, width_scale=1.0, setter=None):
+def sync(obj, brush, scene, width_scale=1.0, setter=None, *, wave_scale=None):
     """Sync stable native styling IDs; ordinary writes use the supplied setter.
 
     Returned structural_writes/curve_writes are extra changes not already counted
@@ -389,6 +389,9 @@ def sync(obj, brush, scene, width_scale=1.0, setter=None):
     missing effects were applied.
     """
     result = {'structural_writes': 0, 'curve_writes': 0, 'warnings': []}
+    # Free-view absolute pixels include the system UI ratio, while scene
+    # cameras retain render units. Keep other effect units unchanged here.
+    wave_scale = width_scale if wave_scale is None else wave_scale
     loop_start = getattr(brush,'loop_start','KEEP')
     loop_orientation = getattr(brush,'loop_orientation','KEEP')
     loop_config = loop_start+'|'+loop_orientation
@@ -486,8 +489,8 @@ def sync(obj, brush, scene, width_scale=1.0, setter=None):
         'Y Offset Pixels': -getattr(brush, 'offset_y', 0) * width_scale,
         'Normal Offset Pixels': getattr(brush, 'normal_offset', 0) * width_scale,
         'Square Caps': float(getattr(brush, 'caps', 'ROUND') == 'SQUARE'),
-        'Wave Amount Pixels': getattr(brush, 'distortion_amplitude', 0) * width_scale if getattr(brush, 'distortion_enabled', False) else 0,
-        'Wave Length Pixels': max(.0001, getattr(brush, 'distortion_wavelength', 100) * width_scale),
+        'Wave Amount Pixels': getattr(brush, 'distortion_amplitude', 0) * wave_scale if getattr(brush, 'distortion_enabled', False) else 0,
+        'Wave Length Pixels': max(.0001, getattr(brush, 'distortion_wavelength', 100) * wave_scale),
         'Wave Phase Radians': getattr(brush, 'distortion_phase', 0),
     }
     for name, value in values.items():

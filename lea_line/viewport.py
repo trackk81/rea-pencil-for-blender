@@ -84,6 +84,8 @@ def _remove_object(scene, obj):
     data = obj.data
     preview_stroke.cleanup(obj)
     preview_camera.cleanup(obj)
+    from . import preview_outline
+    preview_outline.cleanup(obj)
     from . import preview_texture
     preview_texture.cleanup(obj)
     bpy.data.objects.remove(obj, do_unlink=True)
@@ -239,16 +241,15 @@ def sync_preview(scene, material_render=False):
                 if texture_maps.maps(selected_brush):raise ValueError('Free View texture mapping is not yet verified; select Scene Camera')
             if deferred_override:
                 warnings.append(f"{node.name} ({visibility.lower()}): live feature brushes require a sole marked-edge, crease or material-boundary selection; this selection uses the common brush.")
-            width = selected_brush.thickness * backend.width_scale(scene, node)
-            if free_view.dimensions(scene):
-                output = getattr(node, 'line_output', None)
-                mode = output.width_mode if output and output.width_mode != 'INHERIT' else scene.lea_line.width_mode
-                if mode == 'ABSOLUTE':
-                    width *= free_view.pixel_scale()
+            width = (selected_brush.thickness * backend.width_scale(scene, node) if material_render else
+                     preview_camera.stroke_width(scene, node, selected_brush.thickness))
             key = f"{index}:{visibility}"
             desired.add(key)
             obj = _object(scene, owner, key)
+            overlay_visible = False
             if material_render:
+                from . import preview_outline
+                preview_outline.cleanup(obj)
                 from . import preview_texture
                 preview_texture.cleanup(obj)
                 # A detached live snapshot must never become native Line Art's
@@ -340,6 +341,24 @@ def sync_preview(scene, material_render=False):
                 preview_camera.set_enabled(obj, False, _set)
                 preview_stroke.set_enabled(obj, False, _set)
             else:
+                from . import preview_outline
+                exterior_only = (visibility == 'VISIBLE' and features['outline'] and not node.outline_open
+                                 and not any(value for key, value in features.items() if key != 'outline')
+                                 and not material_live and not node.use_material_functions)
+                targets = []
+                if exterior_only:
+                    scope = target_collection.all_objects if target_collection else scene.objects
+                    for target in scope:
+                        if target.type == 'MESH':
+                            targets.append(target)
+                            if len(targets) > 1:
+                                break
+                preview_outline.sync(obj, scene, targets[0] if exterior_only and len(targets) == 1 else None,
+                                     orient_wave=bool(getattr(selected_brush, 'distortion_enabled', False)
+                                                      and not any(getattr(selected_brush, key, False) for key in (
+                                                          'line_direction_enabled', 'split_angle_enabled',
+                                                          'size_curve_enabled', 'alpha_curve_enabled',
+                                                          'dashed', 'normal_offset', 'extend', 'taper'))))
                 live_width = width
                 if getattr(scene.lea_line, 'preview_simple_coverage', False):
                     if live_coverage_supported(selected_brush):
@@ -347,11 +366,33 @@ def sync_preview(scene, material_render=False):
                     elif not live_variable_coverage_supported(selected_brush):
                         warnings.append('Simple live coverage supports uniform solid strokes or directed open size curves; unsupported styles keep geometric width.')
                 _last_sync_stats['geometry_writes'] += preview_camera.sync(obj, scene, live_width, _set)
-                result = preview_stroke.sync(obj, selected_brush, scene, backend.width_scale(scene, node), _set)
+                result = preview_stroke.sync(obj, selected_brush, scene, backend.width_scale(scene, node), _set,
+                                             wave_scale=preview_camera.stroke_width(scene, node, 1.))
                 _last_sync_stats['geometry_writes'] += result['structural_writes'] + result['curve_writes']
                 warnings.extend(result['warnings'])
                 from . import preview_texture
                 preview_texture.sync(obj,selected_brush,scene,node)
+                # Line Art already clips these visible strokes against the scene.
+                # A second surface depth test cuts their pixel width in half.
+                # Limit overlay display to verified basic or sine-wave free-view
+                # path; settled navigation hides stale geometry before refresh.
+                basic_wave = (
+                    getattr(selected_brush, 'distortion_enabled', False)
+                    and getattr(selected_brush, 'caps', 'ROUND') == 'ROUND'
+                    and getattr(selected_brush, 'loop_start', 'KEEP') == 'KEEP'
+                    and getattr(selected_brush, 'loop_orientation', 'KEEP') == 'KEEP'
+                    and not any(getattr(selected_brush, name, 0) for name in (
+                        'split_angle_enabled', 'line_direction_enabled', 'min_line_length',
+                        'extend', 'normal_offset', 'offset_x', 'offset_y',
+                        'distortion_random', 'distortion_cycles_random', 'distortion_phase_random')))
+                overlay_visible = bool(
+                    free_view.dimensions(scene) and exterior_only and len(targets) == 1
+                    and not node.hidden and selected_brush.alpha == 1.
+                    and live_coverage_supported(selected_brush)
+                    and not stamp_brush.active(selected_brush)
+                    and (not preview_stroke._modifiers(obj) or basic_wave)
+                    and not texture_maps.maps(selected_brush))
+            _set(obj, 'show_in_front', overlay_visible, 'visibility_writes')
             zero_alpha=stamp_brush.active(selected_brush) and selected_brush.alpha==0
             if bool(obj.get('rea_stamp_zero_alpha',False))!=zero_alpha:obj['rea_stamp_zero_alpha']=zero_alpha
             _set(obj,'hide_viewport',zero_alpha,'visibility_writes')
