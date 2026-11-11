@@ -252,7 +252,10 @@ def draw_actions(layout, context, tree=None):
             else:
                 layout.label(text='자유 시점의 3D 뷰를 열어 주세요', icon='VIEW3D')
         if not gpu_live and settings.preview_compute=='GPU':
-            layout.label(text='GPU 미지원 설정 · Native 경로 사용',icon='ERROR')
+            layout.label(text='GPU 미리보기 비활성 · 아래 원인 확인',icon='ERROR')
+            if settings.last_message:
+                for message in settings.last_message.splitlines()[:3]:
+                    layout.label(text=message,icon='INFO')
         if entry and not gpu_live:
             layout.prop(settings,'follow_refresh_mode',text='갱신 방식')
             if settings.follow_refresh_mode=='SETTLED':

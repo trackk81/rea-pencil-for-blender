@@ -172,8 +172,8 @@ def sync_preview(scene, material_render=False):
         # Creating a private Scene/camera in that interval can crash its window
         # scene synchronization before the corresponding post handler runs.
         return ['Live preview refresh is deferred during Blender scene restoration.']
-    if bpy.app.version[:2] != (4, 4):
-        raise ValueError("Native preview has been validated for Blender 4.4 only")
+    if bpy.app.version[:2] not in {(4, 4), (4, 5)}:
+        raise ValueError("미리보기는 Blender 4.4 및 4.5에서 지원합니다")
     tree = scene.lea_line.tree
     if tree is None:
         clear_preview(scene)
@@ -190,7 +190,7 @@ def sync_preview(scene, material_render=False):
     if gpu_preview.active(scene) and not material_render:free_view.refresh(scene)
     gpu_preview.stop(scene)
     specifications = backend._specifications(tree)
-    reason = free_view.sync_automatic(scene, specifications) if not material_render else None
+    reason = free_view.sync_automatic(scene, specifications, force=bool(gpu_warning)) if not material_render else None
     if free_view.camera(scene) is None:
         clear_preview(scene)
         return gpu_warning + [reason or "Render preparation needs an active scene camera."]

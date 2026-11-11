@@ -140,14 +140,15 @@ def unsupported_reason(specifications):
 def wants_automatic(scene):
     settings = scene.lea_line
     return settings.preview_enabled and not bpy.app.background and (
-        scene.camera is None or (settings.preview_compute == 'NATIVE' and settings.native_follow_viewport))
+        scene.camera is None or (settings.preview_compute == 'NATIVE' and settings.native_follow_viewport)
+        or (settings.preview_compute == 'GPU' and _entries.get(scene.as_pointer(), {}).get('gpu_fallback', False)))
 
 
-def sync_automatic(scene, specifications):
+def sync_automatic(scene, specifications, *, force=False):
     entry = _entries.get(scene.as_pointer())
     if entry and not entry.get('automatic'):
         return None
-    if not wants_automatic(scene):
+    if not (force or wants_automatic(scene)):
         stop_automatic(scene)
         return None
     view = available_view(scene)
@@ -160,6 +161,8 @@ def sync_automatic(scene, specifications):
         return reason
     if not entry:
         _start(scene, *view, automatic=True)
+    if force:
+        _entries[scene.as_pointer()]['gpu_fallback'] = True
     return None
 
 
